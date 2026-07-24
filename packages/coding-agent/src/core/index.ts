@@ -28,7 +28,7 @@ export {
 export { type BashExecutorOptions, type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 export type { CompactionResult } from "./compaction/index.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./event-bus.ts";
-export { areExperimentalFeaturesEnabled } from "./experimental.ts";
+export { areExperimentalFeaturesEnabled, isSchemaDecisionTrackingEnabled } from "./experimental.ts";
 // Extensions system
 export {
 	type AgentEndEvent,
@@ -77,4 +77,11 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+// Schema-inspired decision tracking
+export {
+	createAfterToolBatchHook,
+	createBeforeToolBatchHook,
+	createOnModelRevisionHook,
+	type DecisionBatch,
+} from "./schema-decisions.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

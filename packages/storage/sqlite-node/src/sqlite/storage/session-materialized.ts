@@ -197,6 +197,7 @@ export function applyEntryToMaterializedState(state: SessionMaterializedState, e
 		case "active_tools_change":
 		case "custom":
 		case "custom_message":
+		case "decision":
 		case "leaf":
 			break;
 		default: {
@@ -356,6 +357,7 @@ export function entryMaterializedValues(
 		case "compaction":
 		case "custom":
 		case "custom_message":
+		case "decision":
 		case "leaf":
 		case "session_info":
 			return [];

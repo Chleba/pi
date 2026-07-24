@@ -114,6 +114,31 @@ export interface LabelEntry extends SessionEntryBase {
 	label: string | undefined;
 }
 
+/**
+ * Decision log entry — structured record of what the agent planned, expected,
+ * and what actually happened. Inspired by Schema's immutable Timeline.
+ *
+ * Does NOT participate in LLM context (ignored by buildSessionContext).
+ * Use for post-mortem analysis and structured decision tracking.
+ */
+export interface DecisionEntry extends SessionEntryBase {
+	type: "decision";
+	/** Human-readable label for the decision. */
+	label: string;
+	/** What the agent planned to do. */
+	plan: string;
+	/** What the agent expected to happen. */
+	expected: string;
+	/** What actually happened (filled in after execution). */
+	actual?: string;
+	/** Outcome classification. */
+	outcome?: "success" | "failure" | "partial";
+	/** Structured revision notes. */
+	revision?: string;
+	/** Optional metadata. */
+	metadata?: Record<string, unknown>;
+}
+
 /** Session metadata entry (e.g., user-defined display name). */
 export interface SessionInfoEntry extends SessionEntryBase {
 	type: "session_info";
@@ -149,6 +174,7 @@ export type SessionEntry =
 	| BranchSummaryEntry
 	| CustomEntry
 	| CustomMessageEntry
+	| DecisionEntry
 	| LabelEntry
 	| SessionInfoEntry;
 
@@ -1048,6 +1074,23 @@ export class SessionManager {
 		this._persist(entry);
 	}
 
+	private _updateEntry(entry: SessionEntry): void {
+		const idx = this.fileEntries.findIndex((e) => e.id === entry.id);
+		if (idx === -1) return;
+		this.fileEntries[idx] = entry;
+		this.byId.set(entry.id, entry);
+		// Rewrite the entire file since we modified an existing entry
+		if (!this.sessionFile) return;
+		const fd = openSync(this.sessionFile, "w");
+		try {
+			for (const e of this.fileEntries) {
+				writeFileSync(fd, `${JSON.stringify(e)}\n`);
+			}
+		} finally {
+			closeSync(fd);
+		}
+	}
+
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
 	 * Does not allow writing CompactionSummaryMessage and BranchSummaryMessage directly.
 	 * Reason: we want these to be top-level entries in the session, not message session entries,
@@ -1186,6 +1229,72 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	// =========================================================================
+	// Decision Log (Schema-inspired)
+	// =========================================================================
+
+	/**
+	 * Append a decision log entry. Records what the agent planned before acting.
+	 * See schema-decisions.ts for the full decision tracking pattern.
+	 * @param label Human-readable label
+	 * @param plan What the agent planned to do
+	 * @param expected What the agent expected to happen
+	 * @returns Entry id
+	 */
+	appendDecision(label: string, plan: string, expected: string, metadata?: Record<string, unknown>): string {
+		const entry: DecisionEntry = {
+			type: "decision",
+			label,
+			plan,
+			expected,
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			metadata,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/**
+	 * Update an existing decision entry with actual outcome.
+	 * @param entryId The decision entry id to update
+	 * @param actual What actually happened
+	 * @param outcome Outcome classification
+	 * @param revision Optional revision notes
+	 */
+	updateDecision(
+		entryId: string,
+		actual: string,
+		outcome: "success" | "failure" | "partial",
+		revision?: string,
+	): void {
+		const entry = this.byId.get(entryId);
+		if (!entry || entry.type !== "decision") return;
+		const decision = entry as DecisionEntry;
+		decision.actual = actual;
+		decision.outcome = outcome;
+		if (revision !== undefined) decision.revision = revision;
+		// Re-append to file with updated data
+		this._updateEntry(decision);
+	}
+
+	/**
+	 * Get all decision entries in the session, ordered by timestamp.
+	 */
+	getDecisions(): DecisionEntry[] {
+		const entries = this.getEntries();
+		return entries.filter((e) => e.type === "decision") as DecisionEntry[];
+	}
+
+	/**
+	 * Get a decision entry by its id.
+	 */
+	getDecision(id: string): DecisionEntry | undefined {
+		const entry = this.byId.get(id);
+		return entry?.type === "decision" ? (entry as DecisionEntry) : undefined;
 	}
 
 	// =========================================================================

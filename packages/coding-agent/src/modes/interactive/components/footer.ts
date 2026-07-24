@@ -1,7 +1,7 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentSession } from "../../../core/agent-session.ts";
-import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
+import { isSchemaDecisionTrackingEnabled } from "../../../core/experimental.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
 import { addUsageToTotals, createUsageTotals } from "../../../core/usage-totals.ts";
 import { theme } from "../theme/theme.ts";
@@ -159,11 +159,14 @@ export class FooterComponent implements Component {
 			contextPercentStr = contextPercentDisplay;
 		}
 		statsParts.push(contextPercentStr);
-		if (areExperimentalFeaturesEnabled()) {
-			statsParts.push(`${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`);
+
+		// Schema badge on the left side of the stats line
+		let schemaBadge = "";
+		if (isSchemaDecisionTrackingEnabled()) {
+			schemaBadge = theme.bold(theme.fg("accent", "schema"));
 		}
 
-		let statsLeft = statsParts.join(" ");
+		let statsLeft = schemaBadge ? `${schemaBadge} ${statsParts.join(" ")}` : statsParts.join(" ");
 
 		// Add model name on the right side, plus thinking level if model supports it
 		const modelName = state.model?.id || "no-model";
@@ -222,7 +225,14 @@ export class FooterComponent implements Component {
 		// Apply dim to each part separately. statsLeft may contain color codes (for context %)
 		// that end with a reset, which would clear an outer dim wrapper. So we dim the parts
 		// before and after the colored section independently.
-		const dimStatsLeft = theme.fg("dim", statsLeft);
+		// Dim everything except the schema badge, which stays bright.
+		let dimStatsLeft: string;
+		if (schemaBadge) {
+			const afterBadge = statsLeft.slice(schemaBadge.length + 1); // skip badge + space
+			dimStatsLeft = schemaBadge + theme.fg("dim", " ") + theme.fg("dim", afterBadge);
+		} else {
+			dimStatsLeft = theme.fg("dim", statsLeft);
+		}
 		const remainder = statsLine.slice(statsLeft.length); // padding + rightSide
 		const dimRemainder = theme.fg("dim", remainder);
 

@@ -10,6 +10,8 @@ import type {
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
+	AfterToolBatchContext,
+	AfterToolBatchResult,
 	AfterToolCallContext,
 	AfterToolCallResult,
 	AgentContext,
@@ -19,8 +21,11 @@ import type {
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	BeforeToolBatchContext,
+	BeforeToolBatchResult,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
+	ModelRevisionContext,
 	PrepareNextTurnContext,
 	QueueMode,
 	StreamFn,
@@ -104,6 +109,12 @@ export interface AgentOptions {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+	beforeToolBatch?: (
+		context: BeforeToolBatchContext,
+		signal?: AbortSignal,
+	) => Promise<BeforeToolBatchResult | undefined>;
+	afterToolBatch?: (context: AfterToolBatchContext, signal?: AbortSignal) => Promise<AfterToolBatchResult | undefined>;
+	onModelRevision?: (context: ModelRevisionContext, signal?: AbortSignal) => Promise<string | undefined>;
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -188,6 +199,15 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
+	public beforeToolBatch?: (
+		context: BeforeToolBatchContext,
+		signal?: AbortSignal,
+	) => Promise<BeforeToolBatchResult | undefined>;
+	public afterToolBatch?: (
+		context: AfterToolBatchContext,
+		signal?: AbortSignal,
+	) => Promise<AfterToolBatchResult | undefined>;
+	public onModelRevision?: (context: ModelRevisionContext, signal?: AbortSignal) => Promise<string | undefined>;
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -219,6 +239,9 @@ export class Agent {
 		this.onResponse = runtimeOptions.onResponse;
 		this.beforeToolCall = runtimeOptions.beforeToolCall;
 		this.afterToolCall = runtimeOptions.afterToolCall;
+		this.beforeToolBatch = runtimeOptions.beforeToolBatch;
+		this.afterToolBatch = runtimeOptions.afterToolBatch;
+		this.onModelRevision = runtimeOptions.onModelRevision;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
@@ -445,6 +468,9 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			beforeToolBatch: this.beforeToolBatch,
+			afterToolBatch: this.afterToolBatch,
+			onModelRevision: this.onModelRevision,
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {

@@ -593,6 +593,9 @@ class TreeList implements Component {
 			case "branch_summary":
 				parts.push("branch summary", entry.summary);
 				break;
+			case "decision":
+				parts.push("decision", entry.label, entry.plan, entry.expected, entry.actual ?? "");
+				break;
 			case "session_info":
 				parts.push("title");
 				if (entry.name) parts.push(entry.name);
@@ -827,6 +830,23 @@ class TreeList implements Component {
 			case "branch_summary":
 				result = theme.fg("warning", `[branch summary]: `) + normalize(entry.summary);
 				break;
+			case "decision": {
+				const outcomeIndicator =
+					entry.outcome === "success"
+						? theme.fg("success", "✓")
+						: entry.outcome === "failure"
+							? theme.fg("error", "✗")
+							: theme.fg("muted", "?");
+				const planText = normalize(entry.plan).slice(0, 100);
+				result =
+					theme.fg("warning", `[decision] `) +
+					theme.bold(entry.label) +
+					" " +
+					outcomeIndicator +
+					" " +
+					theme.fg("muted", planText);
+				break;
+			}
 			case "model_change":
 				result = theme.fg("dim", `[model: ${entry.modelId}]`);
 				break;

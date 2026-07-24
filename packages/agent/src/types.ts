@@ -117,6 +117,74 @@ export interface AfterToolCallContext {
 	context: AgentContext;
 }
 
+/** Context passed to `beforeToolBatch` — captures all tool calls before execution. */
+export interface BeforeToolBatchContext {
+	/** The assistant message that requested the tool calls. */
+	assistantMessage: AssistantMessage;
+	/** All tool calls from this message, before any execute. */
+	toolCalls: AgentToolCall[];
+	/** Current agent context at the time the batch is prepared. */
+	context: AgentContext;
+}
+
+/** Result from `beforeToolBatch` — planning metadata for the decision log. */
+export interface BeforeToolBatchResult {
+	/** Stable ID linking this plan to its outcome in `afterToolBatch`. */
+	planId: string;
+	/** Human-readable label for the decision batch. */
+	label: string;
+	/** The agent's declared plan (extracted from the assistant message). */
+	plan: string;
+	/** What the agent expects to happen. */
+	expected: string;
+	/** Optional metadata (file paths, tool names, etc.). */
+	metadata?: Record<string, unknown>;
+}
+
+/** Context passed to `afterToolBatch` — captures all results after execution. */
+export interface AfterToolBatchContext {
+	/** The assistant message that requested the tool calls. */
+	assistantMessage: AssistantMessage;
+	/** The plan ID returned by `beforeToolBatch` for this batch. */
+	planId: string;
+	/** All tool results from this batch. */
+	toolResults: AgentToolResult<any>[];
+	/** Whether any tool in the batch errored. */
+	hasErrors: boolean;
+	/** Current agent context after all tool results are appended. */
+	context: AgentContext;
+}
+
+/** Result from `afterToolBatch` — signals outcome and potential model revision. */
+export interface AfterToolBatchResult {
+	/** What actually happened (summarized from tool results). */
+	actual: string;
+	/** Outcome classification. */
+	outcome: "success" | "failure" | "partial";
+	/** If true, the agent must revise its model before continuing. */
+	revisionRequired?: boolean;
+	/** Structured revision notes — what the agent learned / how its model changed. */
+	revision?: string;
+	/** Optional metadata. */
+	metadata?: Record<string, unknown>;
+}
+
+/** Context passed to `onModelRevision`. */
+export interface ModelRevisionContext {
+	/** The plan ID that failed. */
+	planId: string;
+	/** The agent's original plan. */
+	plan: string;
+	/** What was expected. */
+	expected: string;
+	/** What actually happened. */
+	actual: string;
+	/** All tool results from the failed batch. */
+	toolResults: AgentToolResult<any>[];
+	/** Current agent context. */
+	context: AgentContext;
+}
+
 /** Context passed to `shouldStopAfterTurn`. */
 export interface ShouldStopAfterTurnContext {
 	/** The assistant message that completed the turn. */
@@ -284,6 +352,53 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+
+	/**
+	 * Called before a batch of tool calls starts executing. Receives all tool calls
+	 * from the current assistant message before any of them run.
+	 *
+	 * Inspired by Schema's "deliberation" phase: the agent declares its plan before
+	 * acting. Use this to capture the agent's intended actions and expectations.
+	 *
+	 * Return a `ToolBatchPreparation` to record planning metadata (e.g. decision log).
+	 * The returned `planId` can be referenced by `afterToolBatch` for outcome tracking.
+	 *
+	 * Contract: must not throw or reject. Return undefined to skip planning capture.
+	 */
+	beforeToolBatch?: (
+		context: BeforeToolBatchContext,
+		signal?: AbortSignal,
+	) => Promise<BeforeToolBatchResult | undefined>;
+
+	/**
+	 * Called after a batch of tool calls finishes executing. Receives all results.
+	 *
+	 * Inspired by Schema's "certify" phase: verify the plan against reality.
+	 * Use this to record outcomes, detect mismatches, and trigger model revision.
+	 *
+	 * Return a `ToolBatchOutcome` to signal that the agent must revise its model
+	 * before continuing. The loop will emit a special revision message.
+	 *
+	 * Contract: must not throw or reject. Return undefined to skip outcome capture.
+	 */
+	afterToolBatch?: (context: AfterToolBatchContext, signal?: AbortSignal) => Promise<AfterToolBatchResult | undefined>;
+
+	/**
+	 * Called when the agent needs to explicitly revise its mental model of the
+	 * codebase or task after a failure or unexpected outcome.
+	 *
+	 * Inspired by Schema's observation that "when predictions fail persistently,
+	 * they do not only adjust the law. They change what the state is."
+	 *
+	 * The hook receives the failed context and can return revision instructions
+	 * that are injected as a user message, forcing the agent to articulate what
+	 * it got wrong before retrying.
+	 *
+	 * Return a revision message or undefined to skip.
+	 *
+	 * Contract: must not throw or reject.
+	 */
+	onModelRevision?: (context: ModelRevisionContext, signal?: AbortSignal) => Promise<string | undefined>;
 }
 
 /**

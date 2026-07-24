@@ -392,6 +392,7 @@ export class AgentSession {
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
+		this._installSchemaDecisionHooks();
 		this._installAgentNextTurnRefresh();
 
 		this._buildRuntime({
@@ -514,6 +515,103 @@ export class AgentSession {
 				isError: hookResult.isError ?? isError,
 				usage: hookResult.usage,
 			};
+		};
+	}
+
+	/**
+	 * Install Schema-inspired decision tracking hooks.
+	 *
+	 * Inspired by the Schema harness (schema-harness.github.io) which achieves
+	 * ~99% on ARC-AGI-3 by forcing models to encode beliefs as executable programs,
+	 * validate against recorded transitions, plan inside verified simulators, and
+	 * maintain an append-only Timeline.
+	 *
+	 * These hooks add:
+	 * - beforeToolBatch: captures the agent's declared plan before execution
+	 * - afterToolBatch: records outcomes and detects mismatches
+	 * - onModelRevision: forces explicit model revision on failure
+	 */
+	private _installSchemaDecisionHooks(): void {
+		this.agent.beforeToolBatch = async ({ assistantMessage, toolCalls, context: _context }) => {
+			// Extract plan from assistant message
+			const textBlocks = assistantMessage.content.filter((c) => c.type === "text");
+			const plan =
+				textBlocks.length > 0 ? textBlocks[0]!.text.slice(0, 500) : JSON.stringify(assistantMessage.content);
+
+			// Look for expected outcome in message
+			let expected = plan;
+			for (const block of textBlocks) {
+				const lower = block.text.toLowerCase();
+				const expectedMatch = lower.match(/expected[\s:]+([^\n]+)/i);
+				if (expectedMatch) {
+					expected = expectedMatch[1].trim();
+					break;
+				}
+			}
+
+			// Create label from tool names
+			const label = toolCalls.map((tc) => tc.name).join(" + ");
+
+			// Append decision entry
+			const entryId = this.sessionManager.appendDecision(label, plan, expected);
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) {
+				this._emit({ type: "entry_appended", entry });
+			}
+
+			return {
+				planId: entryId,
+				label,
+				plan,
+				expected,
+			};
+		};
+
+		this.agent.afterToolBatch = async ({ planId, toolResults, hasErrors, context: _context }) => {
+			// Summarize outcomes
+			const actual = toolResults
+				.map((tr) => {
+					const first = tr.content?.[0];
+					const text = first && first.type === "text" ? first.text : "";
+					return text.slice(0, 200);
+				})
+				.join("\n");
+
+			// Classify outcome
+			const outcome = hasErrors ? "failure" : "success";
+
+			// Update decision entry
+			this.sessionManager.updateDecision(planId, actual, outcome);
+
+			return {
+				actual,
+				outcome,
+				revisionRequired: outcome === "failure",
+				revision:
+					outcome === "failure"
+						? `Decision "${planId}" failed. Expected success but encountered errors.\nActual outcome: ${actual}\n\nRevise your mental model of the codebase before retrying.`
+						: undefined,
+			};
+		};
+
+		this.agent.onModelRevision = async ({ plan, expected, actual, toolResults: _toolResults }) => {
+			return [
+				`## Model Revision Required`,
+				``,
+				`Your plan failed. Before continuing, you must explicitly state what you got wrong.`,
+				``,
+				`**Plan:** ${plan.slice(0, 300)}`,
+				`**Expected:** ${expected.slice(0, 200)}`,
+				`**Actual:** ${actual.slice(0, 300)}`,
+				``,
+				`Answer these questions:`,
+				`1. What was your mental model of the codebase that led to this plan?`,
+				`2. What specific assumption turned out to be wrong?`,
+				`3. How does the actual behavior contradict your expectation?`,
+				`4. What is your corrected understanding?`,
+				``,
+				`Do NOT proceed with another attempt until you have answered these questions.`,
+			].join("\n");
 		};
 	}
 

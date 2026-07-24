@@ -25,6 +25,7 @@ type CompactionPayload = EntryPayload<Extract<SessionTreeEntry, { type: "compact
 type BranchSummaryPayload = EntryPayload<Extract<SessionTreeEntry, { type: "branch_summary" }>>;
 type CustomPayload = EntryPayload<Extract<SessionTreeEntry, { type: "custom" }>>;
 type CustomMessagePayload = EntryPayload<Extract<SessionTreeEntry, { type: "custom_message" }>>;
+type DecisionPayload = EntryPayload<Extract<SessionTreeEntry, { type: "decision" }>>;
 type LabelPayload = EntryPayload<Extract<SessionTreeEntry, { type: "label" }>>;
 type SessionInfoPayload = EntryPayload<Extract<SessionTreeEntry, { type: "session_info" }>>;
 type LeafPayload = EntryPayload<Extract<SessionTreeEntry, { type: "leaf" }>>;
@@ -120,6 +121,11 @@ export function validateSessionTreeEntry(entry: SessionTreeEntry): void {
 				throw invalidEntry(`entry ${entry.id} has invalid leaf payload`);
 			}
 			break;
+		case "decision":
+			if (typeof entry.label !== "string" || typeof entry.plan !== "string" || typeof entry.expected !== "string") {
+				throw invalidEntry(`entry ${entry.id} has invalid decision payload`);
+			}
+			break;
 		default: {
 			const exhaustive: never = entry;
 			throw invalidEntry(`unknown entry type ${(exhaustive as { type?: string }).type ?? "unknown"}`);
@@ -211,6 +217,15 @@ export function decodeEntry(row: SessionEntryRow): SessionTreeEntry {
 				throw invalidEntry(`entry ${row.id} has invalid leaf payload`);
 			}
 			return { ...base, type: "leaf", ...(payload as LeafPayload) };
+		case "decision":
+			if (
+				typeof payload.label !== "string" ||
+				typeof payload.plan !== "string" ||
+				typeof payload.expected !== "string"
+			) {
+				throw invalidEntry(`entry ${row.id} has invalid decision payload`);
+			}
+			return { ...base, type: "decision", ...(payload as DecisionPayload) };
 		default:
 			throw invalidEntry(`unknown entry type ${row.type}`);
 	}

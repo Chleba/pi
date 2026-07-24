@@ -426,6 +426,33 @@ export interface CustomEntry<T = unknown> extends SessionTreeEntryBase {
 	data?: T;
 }
 
+/**
+ * Decision log entry — an append-only record of what the agent planned,
+ * expected, and what actually happened. Inspired by the Schema harness's
+ * immutable Timeline where the agent can revise its model but never alter
+ * the observations it received.
+ *
+ * Use this for structured decision tracking: "I planned X, expected Y,
+ * observed Z — therefore I revised my model."
+ */
+export interface DecisionEntry extends SessionTreeEntryBase {
+	type: "decision";
+	/** Human-readable label for the decision (e.g. "refactor auth module"). */
+	label: string;
+	/** What the agent planned to do. */
+	plan: string;
+	/** What the agent expected to happen as a result. */
+	expected: string;
+	/** What actually happened (filled in after execution). */
+	actual?: string;
+	/** Whether the decision's outcome matched expectations. */
+	outcome?: "success" | "failure" | "partial";
+	/** Structured revision notes — what the agent learned / how its model changed. */
+	revision?: string;
+	/** Optional metadata (file paths, tool names, etc.). */
+	metadata?: Record<string, unknown>;
+}
+
 export interface CustomMessageEntry<T = unknown> extends SessionTreeEntryBase {
 	type: "custom_message";
 	customType: string;
@@ -459,6 +486,7 @@ export type SessionTreeEntry =
 	| BranchSummaryEntry
 	| CustomEntry
 	| CustomMessageEntry
+	| DecisionEntry
 	| LabelEntry
 	| SessionInfoEntry
 	| LeafEntry;

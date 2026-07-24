@@ -205,6 +205,33 @@ async function runLoop(
 			const toolResults: ToolResultMessage[] = [];
 			hasMoreToolCalls = false;
 			if (toolCalls.length > 0) {
+				// beforeToolBatch hook — capture planning context before execution
+				// (Schema-inspired: deliberation phase)
+				let batchPlanId: string | undefined;
+				let _batchPlanLabel: string | undefined;
+				let batchPlan: string | undefined;
+				let batchExpected: string | undefined;
+				if (config.beforeToolBatch) {
+					try {
+						const batchPrep = await config.beforeToolBatch(
+							{
+								assistantMessage: message,
+								toolCalls,
+								context: currentContext,
+							},
+							signal,
+						);
+						if (batchPrep) {
+							batchPlanId = batchPrep.planId;
+							_batchPlanLabel = batchPrep.label;
+							batchPlan = batchPrep.plan;
+							batchExpected = batchPrep.expected;
+						}
+					} catch {
+						// Hook failure is non-fatal — continue with execution
+					}
+				}
+
 				// A "length" stop means the output was cut off by the token limit, so
 				// every tool call in the message may carry truncated arguments. Fail
 				// them all instead of executing potentially borked calls.
@@ -218,6 +245,63 @@ async function runLoop(
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
+				}
+
+				// afterToolBatch hook — certify outcomes against reality
+				// (Schema-inspired: verify phase)
+				let revisionMessage: string | undefined;
+				if (config.afterToolBatch) {
+					try {
+						const toolResultsArray = executedToolBatch.messages.map((m) => {
+							const tr = m as ToolResultMessage;
+							return {
+								content: tr.content ?? [],
+								details: tr.details,
+								usage: tr.usage,
+							} as AgentToolResult<any>;
+						});
+						const batchOutcome = await config.afterToolBatch(
+							{
+								assistantMessage: message,
+								planId: batchPlanId ?? "",
+								toolResults: toolResultsArray,
+								hasErrors: executedToolBatch.messages.some((m) => (m as ToolResultMessage).isError),
+								context: currentContext,
+							},
+							signal,
+						);
+						if (batchOutcome?.revisionRequired && config.onModelRevision) {
+							revisionMessage = await config.onModelRevision(
+								{
+									planId: batchPlanId ?? "",
+									plan: batchPlan ?? "",
+									expected: batchExpected ?? "",
+									actual: batchOutcome.actual,
+									toolResults: toolResultsArray,
+									context: currentContext,
+								},
+								signal,
+							);
+						}
+					} catch {
+						// Hook failure is non-fatal
+					}
+				}
+
+				// If model revision is required, inject the revision message
+				// before the turn ends (Schema-inspired: "reality outranks the model")
+				if (revisionMessage) {
+					const revisionMsg: AgentMessage = {
+						role: "user",
+						content: [{ type: "text", text: revisionMessage }],
+						timestamp: Date.now(),
+					};
+					await emit({ type: "message_start", message: revisionMsg });
+					await emit({ type: "message_end", message: revisionMsg });
+					currentContext.messages.push(revisionMsg);
+					newMessages.push(revisionMsg);
+					// Force another turn so the agent can revise its model
+					hasMoreToolCalls = true;
 				}
 			}
 

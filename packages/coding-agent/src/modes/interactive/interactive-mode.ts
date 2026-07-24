@@ -106,6 +106,7 @@ import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
 import { CustomMessageComponent } from "./components/custom-message.ts";
 import { DaxnutsComponent } from "./components/daxnuts.ts";
+import { DecisionEntryComponent } from "./components/decision-entry.ts";
 import { DynamicBorder } from "./components/dynamic-border.ts";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.ts";
 import { ExtensionEditorComponent } from "./components/extension-editor.ts";
@@ -189,10 +190,17 @@ type CompactionQueuedMessage = {
 	mode: "steer" | "followUp";
 };
 
-type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }>;
+type RenderSessionItem =
+	| AgentMessage
+	| Extract<SessionEntry, { type: "custom" }>
+	| Extract<SessionEntry, { type: "decision" }>;
 
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";
+}
+
+function isDecisionSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "decision" }> {
+	return "type" in item && item.type === "decision";
 }
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
@@ -2873,6 +2881,9 @@ export class InteractiveMode {
 				if (event.entry.type === "custom") {
 					this.addCustomEntryToChat(event.entry);
 					this.ui.requestRender();
+				} else if (event.entry.type === "decision") {
+					this.addDecisionEntryToChat(event.entry);
+					this.ui.requestRender();
 				}
 				break;
 
@@ -3218,6 +3229,21 @@ export class InteractiveMode {
 		this.chatContainer.addChild(component);
 	}
 
+	private addDecisionEntryToChat(entry: Extract<SessionEntry, { type: "decision" }>): void {
+		const component = new DecisionEntryComponent(entry, this.getMarkdownThemeWithSettings());
+		component.setExpanded(this.toolOutputExpanded);
+
+		if (this.streamingComponent) {
+			const streamingIndex = this.chatContainer.children.indexOf(this.streamingComponent);
+			if (streamingIndex >= 0) {
+				this.chatContainer.children.splice(streamingIndex, 0, component);
+				return;
+			}
+		}
+
+		this.chatContainer.addChild(component);
+	}
+
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
 		switch (message.role) {
 			case "bashExecution": {
@@ -3340,6 +3366,11 @@ export class InteractiveMode {
 				continue;
 			}
 
+			if (isDecisionSessionEntry(item)) {
+				this.addDecisionEntryToChat(item);
+				continue;
+			}
+
 			const message = item;
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
@@ -3412,12 +3443,16 @@ export class InteractiveMode {
 		entries: SessionEntry[],
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
-		const items = entries.flatMap((entry): RenderSessionItem[] => {
+		const items: RenderSessionItem[] = [];
+		for (const entry of entries) {
 			if (entry.type === "custom") {
-				return [entry];
+				items.push(entry);
+			} else if (entry.type === "decision") {
+				items.push(entry);
+			} else {
+				items.push(...sessionEntryToContextMessages(entry));
 			}
-			return sessionEntryToContextMessages(entry);
-		});
+		}
 		this.renderSessionItems(items, options);
 	}
 
