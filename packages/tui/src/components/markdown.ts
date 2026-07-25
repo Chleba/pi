@@ -3,6 +3,13 @@ import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
 import type { Component } from "../tui.ts";
 import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
+// Special markers for schema declarations (<plan> and <expected> tags)
+// These are replaced with HTML-like markers that the markdown renderer can style
+const PLAN_OPEN_MARKER = "\u0000PLAN\u0000";
+const PLAN_CLOSE_MARKER = "\u0000/PLAN\u0000";
+const EXPECTED_OPEN_MARKER = "\u0000EXPECTED\u0000";
+const EXPECTED_CLOSE_MARKER = "\u0000/EXPECTED\u0000";
+
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
 class StrictStrikethroughTokenizer extends Tokenizer {
@@ -53,6 +60,21 @@ markdownParser.setOptions({
 });
 
 /**
+ * Pre-process text to replace <plan> and <expected> tags with styled markers.
+ * These markers are later converted to styled blocks in the markdown renderer.
+ */
+function preprocessSchemaDeclarations(text: string): string {
+	// Replace <plan>...</plan> with markers (handles both strict and tolerant matching)
+	text = text.replace(/<plan>([\s\S]*?)(?:<\/plan>|$)/gi, `\n${PLAN_OPEN_MARKER}$1${PLAN_CLOSE_MARKER}\n`);
+	// Replace <expected>...</expected> with markers
+	text = text.replace(
+		/<expected>([\s\S]*?)(?:<\/expected>|$)/gi,
+		`\n${EXPECTED_OPEN_MARKER}$1${EXPECTED_CLOSE_MARKER}\n`,
+	);
+	return text;
+}
+
+/**
  * Default text styling for markdown content.
  * Applied to all text unless overridden by markdown formatting.
  */
@@ -93,6 +115,10 @@ export interface MarkdownTheme {
 	highlightCode?: (code: string, lang?: string) => string[];
 	/** Prefix applied to each rendered code block line (default: "  ") */
 	codeBlockIndent?: string;
+	/** Render a <plan> block with border, background, and label */
+	planBlock?: (content: string) => string;
+	/** Render an <expected> block with border, background, and label */
+	expectedBlock?: (content: string) => string;
 }
 
 export interface MarkdownOptions {
@@ -170,8 +196,11 @@ export class Markdown implements Component {
 		// Replace tabs with 3 spaces for consistent rendering
 		const normalizedText = this.text.replace(/\t/g, "   ");
 
+		// Pre-process schema declarations (<plan> and <expected> tags)
+		const processedText = preprocessSchemaDeclarations(normalizedText);
+
 		// Parse markdown to HTML-like tokens
-		const tokens = markdownParser.lexer(normalizedText);
+		const tokens = markdownParser.lexer(processedText);
 		trimPartialClosingFences(tokens);
 
 		// Convert tokens to styled terminal output
@@ -186,9 +215,12 @@ export class Markdown implements Component {
 			}
 		}
 
+		// Post-process to convert PLAN/EXPECTED markers into styled blocks
+		const processedLines = this.renderSchemaBlocks(renderedLines);
+
 		// Wrap lines (NO padding, NO background yet)
 		const wrappedLines: string[] = [];
-		for (const line of renderedLines) {
+		for (const line of processedLines) {
 			if (isImageLine(line)) {
 				wrappedLines.push(line);
 			} else {
@@ -239,6 +271,49 @@ export class Markdown implements Component {
 		this.cachedLines = result;
 
 		return result.length > 0 ? result : [""];
+	}
+
+	/**
+	 * Post-process rendered lines to convert PLAN/EXPECTED markers into styled blocks.
+	 */
+	private renderSchemaBlocks(lines: string[]): string[] {
+		const result: string[] = [];
+		let i = 0;
+
+		while (i < lines.length) {
+			const line = lines[i];
+
+			// Check for PLAN block
+			if (line.includes(PLAN_OPEN_MARKER) && line.includes(PLAN_CLOSE_MARKER)) {
+				const planContent = line.replace(PLAN_OPEN_MARKER, "").replace(PLAN_CLOSE_MARKER, "").trim();
+				if (this.theme.planBlock) {
+					result.push(this.theme.planBlock(planContent));
+				} else {
+					// Fallback: render as plain text with marker removed
+					result.push(planContent);
+				}
+				i++;
+				continue;
+			}
+
+			// Check for EXPECTED block
+			if (line.includes(EXPECTED_OPEN_MARKER) && line.includes(EXPECTED_CLOSE_MARKER)) {
+				const expectedContent = line.replace(EXPECTED_OPEN_MARKER, "").replace(EXPECTED_CLOSE_MARKER, "").trim();
+				if (this.theme.expectedBlock) {
+					result.push(this.theme.expectedBlock(expectedContent));
+				} else {
+					// Fallback: render as plain text with marker removed
+					result.push(expectedContent);
+				}
+				i++;
+				continue;
+			}
+
+			result.push(line);
+			i++;
+		}
+
+		return result;
 	}
 
 	/**

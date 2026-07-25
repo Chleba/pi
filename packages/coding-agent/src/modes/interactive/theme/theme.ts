@@ -92,6 +92,13 @@ const ThemeJsonSchema = Type.Object({
 		thinkingMax: Type.Optional(ColorValueSchema),
 		// Bash Mode (1 color)
 		bashMode: ColorValueSchema,
+		// Schema declarations (plan/expected)
+		planBg: ColorValueSchema,
+		planBorder: ColorValueSchema,
+		planLabel: ColorValueSchema,
+		expectedBg: ColorValueSchema,
+		expectedBorder: ColorValueSchema,
+		expectedLabel: ColorValueSchema,
 	}),
 	export: Type.Optional(
 		Type.Object({
@@ -152,7 +159,11 @@ export type ThemeColor =
 	| "thinkingHigh"
 	| "thinkingXhigh"
 	| "thinkingMax"
-	| "bashMode";
+	| "bashMode"
+	| "planBorder"
+	| "planLabel"
+	| "expectedBorder"
+	| "expectedLabel";
 
 export type ThemeBg =
 	| "selectedBg"
@@ -160,7 +171,9 @@ export type ThemeBg =
 	| "customMessageBg"
 	| "toolPendingBg"
 	| "toolSuccessBg"
-	| "toolErrorBg";
+	| "toolErrorBg"
+	| "planBg"
+	| "expectedBg";
 
 type ColorMode = "truecolor" | "256color";
 
@@ -1262,6 +1275,23 @@ export function getMarkdownTheme(): MarkdownTheme {
 			} catch {
 				return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
 			}
+		},
+		planBlock: (content: string) => {
+			const border = theme.fg("planBorder", `┌─[ PLAN ]─${"─".repeat(Math.max(0, content.length + 10 - 8))}┐`);
+			const lines = content.split("\n");
+			const bodyLines = lines.map((line) => theme.fg("planBorder", "│ ") + line);
+			const footer = theme.fg("planBorder", `└${"─".repeat(border.length - 2)}┘`);
+			return [border, ...bodyLines, footer].join("\n");
+		},
+		expectedBlock: (content: string) => {
+			const border = theme.fg(
+				"expectedBorder",
+				`┌─[ EXPECTED ]─${"─".repeat(Math.max(0, content.length + 12 - 11))}┐`,
+			);
+			const lines = content.split("\n");
+			const bodyLines = lines.map((line) => theme.fg("expectedBorder", "│ ") + line);
+			const footer = theme.fg("expectedBorder", `└${"─".repeat(border.length - 2)}┘`);
+			return [border, ...bodyLines, footer].join("\n");
 		},
 	};
 }

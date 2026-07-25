@@ -362,6 +362,106 @@ describe("Schema Decision Tracking", () => {
 			expect(out).toContain("Model Revision Required");
 			expect(out).toContain("Answer these questions");
 		});
+
+		it("extracts plan content when closing </plan> tag is missing", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm);
+			const assistant = makeAssistantMessage(
+				"<plan>Edit app.ts to fix the import\n<expected>tests pass</expected>\n\nnow let me run tests",
+			);
+
+			const before = await hooks.beforeToolBatch({
+				assistantMessage: assistant,
+				toolCalls: [makeToolCall("edit")],
+				context: EMPTY_CONTEXT,
+			});
+			const after = await hooks.afterToolBatch({
+				assistantMessage: assistant,
+				planId: before!.planId,
+				toolResults: [makeToolResult("done")],
+				hasErrors: false,
+				context: EMPTY_CONTEXT,
+			});
+
+			// Tolerant regex captures content even without </plan>.
+			expect(after?.outcome).toBe("success");
+			expect(after?.revisionRequired).toBe(false);
+			const decision = sm.getDecisions()[0]!;
+			expect(decision.plan).toContain("Edit app.ts to fix the import");
+			expect(decision.expected).toBe("tests pass");
+		});
+
+		it("extracts expected content when closing </expected> tag is missing", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm);
+			const assistant = makeAssistantMessage("<plan>Edit app.ts</plan>\n<expected>tests pass\nnow moving on");
+
+			const before = await hooks.beforeToolBatch({
+				assistantMessage: assistant,
+				toolCalls: [makeToolCall("edit")],
+				context: EMPTY_CONTEXT,
+			});
+			const after = await hooks.afterToolBatch({
+				assistantMessage: assistant,
+				planId: before!.planId,
+				toolResults: [makeToolResult("done")],
+				hasErrors: false,
+				context: EMPTY_CONTEXT,
+			});
+
+			expect(after?.outcome).toBe("success");
+			expect(after?.revisionRequired).toBe(false);
+			const decision = sm.getDecisions()[0]!;
+			expect(decision.plan).toBe("Edit app.ts");
+			expect(decision.expected).toContain("tests pass");
+		});
+
+		it("both tags missing closing: tolerant regex still declares the batch", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm);
+			const assistant = makeAssistantMessage("<plan>Edit app.ts\n<expected>tests pass");
+
+			const before = await hooks.beforeToolBatch({
+				assistantMessage: assistant,
+				toolCalls: [makeToolCall("edit")],
+				context: EMPTY_CONTEXT,
+			});
+			const after = await hooks.afterToolBatch({
+				assistantMessage: assistant,
+				planId: before!.planId,
+				toolResults: [makeToolResult("done")],
+				hasErrors: false,
+				context: EMPTY_CONTEXT,
+			});
+
+			// Both tolerantly extracted → declared = true → not rejected.
+			expect(after?.outcome).toBe("success");
+			expect(after?.revisionRequired).toBe(false);
+		});
+
+		it("strict match takes priority when closing tags are present", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm);
+			const assistant = makeAssistantMessage("<plan>Edit app.ts</plan>\n<expected>tests pass</expected>");
+
+			const before = await hooks.beforeToolBatch({
+				assistantMessage: assistant,
+				toolCalls: [makeToolCall("edit")],
+				context: EMPTY_CONTEXT,
+			});
+			const _after = await hooks.afterToolBatch({
+				assistantMessage: assistant,
+				planId: before!.planId,
+				toolResults: [makeToolResult("done")],
+				hasErrors: false,
+				context: EMPTY_CONTEXT,
+			});
+
+			void _after;
+			const decision = sm.getDecisions()[0]!;
+			expect(decision.plan).toBe("Edit app.ts");
+			expect(decision.expected).toBe("tests pass");
+		});
 	});
 
 	describe("decisions tool", () => {

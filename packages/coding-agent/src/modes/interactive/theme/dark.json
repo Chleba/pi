@@ -77,7 +77,15 @@
 		"thinkingXhigh": "#d183e8",
 		"thinkingMax": "#ff5fff",
 
-		"bashMode": "green"
+		"bashMode": "green",
+
+		"planBg": "#1a3a1a",
+		"planBorder": "#4ade80",
+		"planLabel": "#22c55e",
+
+		"expectedBg": "#1a2a3a",
+		"expectedBorder": "#60a5fa",
+		"expectedLabel": "#3b82f6"
 	},
 	"export": {
 		"pageBg": "#18181e",
