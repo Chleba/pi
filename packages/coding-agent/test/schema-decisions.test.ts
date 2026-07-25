@@ -15,6 +15,7 @@ import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { createSchemaDecisionHooks } from "../src/core/schema-decisions.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { createDecisionsToolDefinition } from "../src/core/tools/decisions.ts";
 
 const USAGE: Usage = {
 	input: 0,
@@ -360,6 +361,77 @@ describe("Schema Decision Tracking", () => {
 			});
 			expect(out).toContain("Model Revision Required");
 			expect(out).toContain("Answer these questions");
+		});
+	});
+
+	describe("decisions tool", () => {
+		it("returns all decisions by default, newest first", async () => {
+			const sm = SessionManager.inMemory();
+			sm.appendDecision({
+				planId: "p1",
+				label: "first",
+				plan: "p1",
+				expected: "e1",
+				actual: "a1",
+				outcome: "success",
+			});
+			sm.appendDecision({
+				planId: "p2",
+				label: "second",
+				plan: "p2",
+				expected: "e2",
+				actual: "a2",
+				outcome: "failure",
+			});
+
+			const def = createDecisionsToolDefinition(sm);
+			const result = await def.execute("t1", {}, undefined, undefined, undefined as never);
+
+			const text = (result.content[0] as { type: "text"; text: string }).text;
+			expect(text).toContain("first");
+			expect(text).toContain("second");
+			// newest first: second appears before first
+			expect(text.indexOf("second")).toBeLessThan(text.indexOf("first"));
+			expect(result.details.returned).toBe(2);
+			expect(result.details.total).toBe(2);
+		});
+
+		it("filters by outcome", async () => {
+			const sm = SessionManager.inMemory();
+			sm.appendDecision({ planId: "p1", label: "ok", plan: "p", expected: "e", actual: "a", outcome: "success" });
+			sm.appendDecision({ planId: "p2", label: "boom", plan: "p", expected: "e", actual: "a", outcome: "failure" });
+
+			const def = createDecisionsToolDefinition(sm);
+			const result = await def.execute("t1", { outcome: "failure" }, undefined, undefined, undefined as never);
+
+			const text = (result.content[0] as { type: "text"; text: string }).text;
+			expect(text).toContain("boom");
+			expect(text).not.toContain("ok");
+			expect(result.details.returned).toBe(1);
+			expect(result.details.total).toBe(1);
+		});
+
+		it("clamps excessive limit to 100 and respects small limits", async () => {
+			const sm = SessionManager.inMemory();
+			for (let i = 0; i < 5; i++) {
+				sm.appendDecision({ planId: `p${i}`, label: `d${i}`, plan: "p", expected: "e", outcome: "success" });
+			}
+
+			const def = createDecisionsToolDefinition(sm);
+			const r2 = await def.execute("t1", { limit: 2 }, undefined, undefined, undefined as never);
+			expect(r2.details.returned).toBe(2);
+
+			const rHuge = await def.execute("t1", { limit: 10_000 }, undefined, undefined, undefined as never);
+			expect(rHuge.details.returned).toBe(5); // only 5 exist
+		});
+
+		it("reports empty timeline explicitly", async () => {
+			const sm = SessionManager.inMemory();
+			const def = createDecisionsToolDefinition(sm);
+			const result = await def.execute("t1", {}, undefined, undefined, undefined as never);
+			const text = (result.content[0] as { type: "text"; text: string }).text;
+			expect(text).toContain("(no decisions recorded)");
+			expect(result.details.total).toBe(0);
 		});
 	});
 });

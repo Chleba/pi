@@ -36,6 +36,7 @@ import {
 	Text,
 	TruncatedText,
 	TUI,
+	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
@@ -2693,6 +2694,11 @@ export class InteractiveMode {
 			}
 			if (text === "/session") {
 				this.handleSessionCommand();
+				this.editor.setText("");
+				return;
+			}
+			if (text === "/decisions") {
+				this.handleDecisionsCommand();
 				this.editor.setText("");
 				return;
 			}
@@ -5695,6 +5701,46 @@ export class InteractiveMode {
 						? `\n${theme.fg("dim", "Cache Re-billed:")} $${cacheWaste.missedCost.toFixed(3)} ${theme.fg("dim", `(${detail})`)}`
 						: `\n${theme.fg("dim", "Cache Re-billed:")} ${detail}`;
 			}
+		}
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(info, 1, 0));
+		this.ui.requestRender();
+	}
+
+	/**
+	 * Render the schema decision Timeline (post-mortem view) into the chat.
+	 * Shows the most recent decisions with outcome indicators, plan, expected,
+	 * actual, and revision notes. No-op message when schema tracking is off.
+	 */
+	private handleDecisionsCommand(): void {
+		const decisions = this.sessionManager.getDecisions();
+		let info = `${theme.bold("Schema Decision Timeline")}\n\n`;
+		if (decisions.length === 0) {
+			info += theme.fg("dim", "(no decisions recorded this session)");
+		} else {
+			const recent = decisions.slice(-50).reverse();
+			for (const d of recent) {
+				const indicator =
+					d.outcome === "success"
+						? theme.fg("success", "ok")
+						: d.outcome === "failure"
+							? theme.fg("error", "FAIL")
+							: d.outcome === "partial"
+								? theme.fg("warning", "PART")
+								: theme.fg("dim", "?");
+				info += `${indicator} ${theme.bold(d.label)}\n`;
+				info += `  ${theme.fg("dim", "plan:")} ${truncateToWidth(d.plan.replace(/\n/g, " "), 100)}\n`;
+				if (d.expected && d.expected !== "(unverified)") {
+					info += `  ${theme.fg("dim", "exp:")} ${truncateToWidth(d.expected.replace(/\n/g, " "), 100)}\n`;
+				}
+				if (d.actual)
+					info += `  ${theme.fg("dim", "act:")} ${truncateToWidth(d.actual.replace(/\n/g, " "), 100)}\n`;
+				if (d.revision)
+					info += `  ${theme.fg("dim", "rev:")} ${truncateToWidth(d.revision.replace(/\n/g, " "), 100)}\n`;
+				info += "\n";
+			}
+			info += theme.fg("dim", `(${decisions.length} total, showing ${recent.length} most recent)`);
 		}
 
 		this.chatContainer.addChild(new Spacer(1));

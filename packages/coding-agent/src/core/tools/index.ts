@@ -10,6 +10,12 @@ export {
 	createLocalBashOperations,
 } from "./bash.ts";
 export {
+	createDecisionsToolDefinition,
+	type DecisionsOutcomeFilter,
+	type DecisionsToolDetails,
+	type DecisionsToolInput,
+} from "./decisions.ts";
+export {
 	createEditTool,
 	createEditToolDefinition,
 	type EditOperations,

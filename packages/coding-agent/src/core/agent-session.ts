@@ -106,6 +106,7 @@ import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+import { createDecisionsToolDefinition } from "./tools/decisions.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
@@ -2623,6 +2624,20 @@ export class AgentSession {
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
 
+		// When schema decision tracking is enabled, register the read-only
+		// `decisions` tool so the agent can explicitly query its own Timeline
+		// (the system-prompt digest only surfaces the most recent failures).
+		const schemaActiveExtras: string[] = [];
+		if (isSchemaDecisionTrackingEnabled()) {
+			const decisionsDef = createDecisionsToolDefinition(this.sessionManager);
+			// The tool-definition map is typed at the loose ToolDefinition level
+			// (mirroring how createAllToolDefinitions results are stored via
+			// `as ToolDefinition`), so the invariant generic on the concrete
+			// schema is erased here like the other base tools.
+			this._baseToolDefinitions.set(decisionsDef.name, decisionsDef as ToolDefinition);
+			schemaActiveExtras.push(decisionsDef.name);
+		}
+
 		const extensionsResult = this._resourceLoader.getExtensions();
 		if (options.flagValues) {
 			for (const [name, value] of options.flagValues) {
@@ -2645,7 +2660,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write"];
+			: ["read", "bash", "edit", "write", ...schemaActiveExtras];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,

@@ -170,7 +170,12 @@ for (const d of decisions) {
 5. **Auto-compaction aware** — Include decision summaries in compaction output for long-term memory
 6. **Queryable world-model artifact (P2)** — A versioned `codebase_model.md` the agent edits; edits to the model are "state revision" (Einstein), edits to `expected` are "rule revision" (Lorentz); persistent failure escalates from answering the 4 questions to editing the artifact.
 7. **Persistence-gated revision (P3)** — Track `consecutiveFailures` keyed by normalized plan shape; `onModelRevision` only fires after N failures and escalates (question → edit artifact → must probe with a minimal reproducer).
-8. **`decisions` read-only tool and `/decisions` slash command (P5)** — Let the agent explicitly query its full Timeline and let the user dump the post-mortem in the TUI.
+
+### Landed since the P0/P4 commit
+
+**P1 — Structured pre-batch declarations.** Default behaviour (when schema tracking is enabled) requires every mutating tool batch (bash, edit, write) to be preceded by both `<plan>...</plan>` and `<expected>...</expected>` blocks. A mutating batch missing the declaration is recorded with `outcome: "failure"` regardless of `hasErrors`, and `onModelRevision` returns a dedicated "Declaration Required" prompt routed through a closure-bound `declarationMissingPlanIds` set (afterToolBatch already deletes the pendingPlans entry, so this is how the verdict survives the after→revision step). `isMutatingToolCall` and `requireDeclarations` are options on `createSchemaDecisionHooks` so callers can opt out or extend the mutating set. The system prompt also carries `SCHEMA_DECLARATION_CONVENTION` while schema tracking is on, so the gate is enforced and the agent is told how to satisfy it in the same turn.
+
+**P5 — `decisions` read-only tool and `/decisions` slash command.** The `decisions` tool (`createDecisionsToolDefinition`) lets the agent explicitly query its own Timeline (plan / expected / actual / revision), filtered by outcome and capped at 100. It is only registered when schema tracking is enabled. The `/decisions` slash command renders a post-mortem view (most recent 50 decisions, newest first) in the TUI so the user can audit decisions at a glance.
 
 ## Active design notes (P0 + P4 follow-up)
 
