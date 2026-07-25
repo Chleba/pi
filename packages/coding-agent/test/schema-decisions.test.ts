@@ -129,10 +129,134 @@ describe("Schema Decision Tracking", () => {
 	});
 
 	describe("createSchemaDecisionHooks", () => {
+		it("requires an explicit <plan>/<expected> declaration on mutating batches (default)", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm);
+			// No <plan>/<expected> blocks → must be rejected as missing-declaration.
+			const assistant = makeAssistantMessage("let me edit app.ts now");
+
+			const before = await hooks.beforeToolBatch({
+				assistantMessage: assistant,
+				toolCalls: [makeToolCall("edit")],
+				context: EMPTY_CONTEXT,
+			});
+			const after = await hooks.afterToolBatch({
+				assistantMessage: assistant,
+				planId: before!.planId,
+				toolResults: [makeToolResult("done")],
+				hasErrors: false,
+				context: EMPTY_CONTEXT,
+			});
+
+			// Outcome is forced to failure even though hasErrors is false.
+			expect(after?.outcome).toBe("failure");
+			expect(after?.revisionRequired).toBe(true);
+
+			const decision = sm.getDecisions()[0]!;
+			expect(decision.expected).toBe("(unverified)");
+			expect(decision.revision).toContain("declaration");
+			expect(decision.outcome).toBe("failure");
+
+			// onModelRevision now routes through the missing-declaration path.
+			const revision = await hooks.onModelRevision({
+				planId: before!.planId,
+				plan: decision.plan,
+				expected: decision.expected,
+				actual: after!.actual,
+				toolResults: [],
+				context: EMPTY_CONTEXT,
+			});
+			expect(revision).toContain("Declaration Required Before Mutating Actions");
+		});
+
+		it("accepts a declared mutating batch and certifies the outcome normally", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm);
+			const assistant = makeAssistantMessage(
+				"<plan>Edit app.ts to fix the import</plan>\n<expected>tsgo --noEmit exits 0</expected>",
+			);
+
+			const before = await hooks.beforeToolBatch({
+				assistantMessage: assistant,
+				toolCalls: [makeToolCall("edit")],
+				context: EMPTY_CONTEXT,
+			});
+			const after = await hooks.afterToolBatch({
+				assistantMessage: assistant,
+				planId: before!.planId,
+				toolResults: [makeToolResult("done")],
+				hasErrors: false,
+				context: EMPTY_CONTEXT,
+			});
+
+			expect(after?.outcome).toBe("success");
+			expect(after?.revisionRequired).toBe(false);
+
+			const decision = sm.getDecisions()[0]!;
+			expect(decision.plan).toBe("Edit app.ts to fix the import");
+			expect(decision.expected).toBe("tsgo --noEmit exits 0");
+		});
+
+		it("does not enforce declarations on read-only batches (read/grep/find/ls)", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm);
+			const assistant = makeAssistantMessage("let me grep for the symbol");
+
+			const before = await hooks.beforeToolBatch({
+				assistantMessage: assistant,
+				toolCalls: [makeToolCall("grep")],
+				context: EMPTY_CONTEXT,
+			});
+			const after = await hooks.afterToolBatch({
+				assistantMessage: assistant,
+				planId: before!.planId,
+				toolResults: [makeToolResult("matches: 3")],
+				hasErrors: false,
+				context: EMPTY_CONTEXT,
+			});
+
+			// Read-only + no declaration → still success, no revision required.
+			expect(after?.outcome).toBe("success");
+			expect(after?.revisionRequired).toBe(false);
+		});
+
+		it("skips declaration enforcement when requireDeclarations is false", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm, { requireDeclarations: false });
+			const assistant = makeAssistantMessage("just edit it");
+
+			const before = await hooks.beforeToolBatch({
+				assistantMessage: assistant,
+				toolCalls: [makeToolCall("edit")],
+				context: EMPTY_CONTEXT,
+			});
+			const after = await hooks.afterToolBatch({
+				assistantMessage: assistant,
+				planId: before!.planId,
+				toolResults: [makeToolResult("done")],
+				hasErrors: false,
+				context: EMPTY_CONTEXT,
+			});
+
+			expect(after?.outcome).toBe("success");
+			expect(after?.revisionRequired).toBe(false);
+			const revision = await hooks.onModelRevision({
+				planId: before!.planId,
+				plan: "p",
+				expected: "e",
+				actual: "a",
+				toolResults: [],
+				context: EMPTY_CONTEXT,
+			});
+			expect(revision).toContain("Model Revision Required");
+		});
+
 		it("records a full decision after the batch and classifies by hasErrors", async () => {
 			const sm = SessionManager.inMemory();
 			const hooks = createSchemaDecisionHooks(sm);
-			const assistant = makeAssistantMessage("I will edit app.ts.\n<expected>tests pass</expected>");
+			const assistant = makeAssistantMessage(
+				"<plan>Edit app.ts</plan>\n<expected>tests pass</expected>\n<plan>nothing</plan>",
+			);
 
 			const before = await hooks.beforeToolBatch({
 				assistantMessage: assistant,
@@ -160,11 +284,22 @@ describe("Schema Decision Tracking", () => {
 			expect(decisions[0]?.expected).toBe("tests pass");
 			expect(decisions[0]?.outcome).toBe("failure");
 			expect(decisions[0]?.metadata?.planId).toBe(before!.planId);
+
+			// When declared but failed, onModelRevision goes through the regular revision prompt.
+			const revision = await hooks.onModelRevision({
+				planId: before!.planId,
+				plan: decisions[0]!.plan,
+				expected: decisions[0]!.expected,
+				actual: after!.actual,
+				toolResults: [],
+				context: EMPTY_CONTEXT,
+			});
+			expect(revision).toContain("Model Revision Required");
 		});
 
 		it("records expected as (unverified) when no explicit block is present", async () => {
 			const sm = SessionManager.inMemory();
-			const hooks = createSchemaDecisionHooks(sm);
+			const hooks = createSchemaDecisionHooks(sm, { requireDeclarations: false });
 			const assistant = makeAssistantMessage("I will run the tests now.");
 
 			const before = await hooks.beforeToolBatch({
@@ -188,7 +323,10 @@ describe("Schema Decision Tracking", () => {
 		it("invokes onDecisionAppended after the entry is written", async () => {
 			const seen: string[] = [];
 			const sm = SessionManager.inMemory();
-			const hooks = createSchemaDecisionHooks(sm, { onDecisionAppended: (id) => seen.push(id) });
+			const hooks = createSchemaDecisionHooks(sm, {
+				requireDeclarations: false,
+				onDecisionAppended: (id) => seen.push(id),
+			});
 			const assistant = makeAssistantMessage("plan");
 
 			const before = await hooks.beforeToolBatch({
@@ -208,8 +346,10 @@ describe("Schema Decision Tracking", () => {
 			expect(sm.getDecision(seen[0]!)).toBeDefined();
 		});
 
-		it("onModelRevision returns a structured revision prompt", async () => {
-			const hooks = createSchemaDecisionHooks(SessionManager.inMemory());
+		it("onModelRevision returns a structured revision prompt when declared and failed", async () => {
+			// requireDeclarations=false so we exercise the regular revision path
+			// without having to first set up a declared plan.
+			const hooks = createSchemaDecisionHooks(SessionManager.inMemory(), { requireDeclarations: false });
 			const out = await hooks.onModelRevision({
 				planId: "p",
 				plan: "p",

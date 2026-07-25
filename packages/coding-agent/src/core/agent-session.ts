@@ -98,7 +98,7 @@ import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import { createSchemaDecisionHooks } from "./schema-decisions.ts";
+import { createSchemaDecisionHooks, SCHEMA_DECLARATION_CONVENTION } from "./schema-decisions.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
@@ -582,15 +582,17 @@ export class AgentSession {
 	}
 
 	/**
-	 * Append the recent-decisions digest to a base system prompt. No-op when
-	 * schema tracking is disabled (saves an extra pass over entries and keeps
-	 * the prompt byte-for-byte identical to the base).
+	 * Append the recent-decisions digest and the declaration convention to a
+	 * base system prompt. No-op when schema tracking is disabled (saves an
+	 * extra pass over entries and keeps the prompt byte-for-byte identical to
+	 * the base).
 	 */
 	private _decorateSystemPromptWithDecisions(baseSystemPrompt: string): string {
 		if (!isSchemaDecisionTrackingEnabled()) return baseSystemPrompt;
+		const parts: string[] = [baseSystemPrompt, SCHEMA_DECLARATION_CONVENTION];
 		const digest = this.sessionManager.getRecentDecisionsDigest(5);
-		if (!digest) return baseSystemPrompt;
-		return `${baseSystemPrompt}\n\n${digest}`;
+		if (digest) parts.push(digest);
+		return parts.join("\n\n");
 	}
 
 	// =========================================================================

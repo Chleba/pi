@@ -168,10 +168,9 @@ for (const d of decisions) {
 3. **Targeted probing** — When unsure about a module, require a minimal test file before broader changes
 4. **Decision graph visualization** — TUI component showing decision flow, outcomes, and revision chains
 5. **Auto-compaction aware** — Include decision summaries in compaction output for long-term memory
-6. **Structured pre-batch declarations (P1)** — Require a structured `<plan>...</plan><expected>...</expected>` block or a dedicated `plan` tool before any mutating batch; reject batches that lack one as `outcome: "unverified"`.
-7. **Queryable world-model artifact (P2)** — A versioned `codebase_model.md` the agent edits; edits to the model are "state revision" (Einstein), edits to `expected` are "rule revision" (Lorentz); persistent failure escalates from answering the 4 questions to editing the artifact.
-8. **Persistence-gated revision (P3)** — Track `consecutiveFailures` keyed by normalized plan shape; `onModelRevision` only fires after N failures and escalates (question → edit artifact → must probe with a minimal reproducer).
-9. **`decisions` read-only tool and `/decisions` slash command (P5)** — Let the agent explicitly query its full Timeline and let the user dump the post-mortem in the TUI.
+6. **Queryable world-model artifact (P2)** — A versioned `codebase_model.md` the agent edits; edits to the model are "state revision" (Einstein), edits to `expected` are "rule revision" (Lorentz); persistent failure escalates from answering the 4 questions to editing the artifact.
+7. **Persistence-gated revision (P3)** — Track `consecutiveFailures` keyed by normalized plan shape; `onModelRevision` only fires after N failures and escalates (question → edit artifact → must probe with a minimal reproducer).
+8. **`decisions` read-only tool and `/decisions` slash command (P5)** — Let the agent explicitly query its full Timeline and let the user dump the post-mortem in the TUI.
 
 ## Active design notes (P0 + P4 follow-up)
 

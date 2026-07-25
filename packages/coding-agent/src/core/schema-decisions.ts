@@ -41,7 +41,19 @@ export interface DecisionPlanId {
 	label: string;
 	plan: string;
 	expected: string;
+	/** True when at least one tool in the batch is mutating (write/edit/bash). */
+	mutating: boolean;
+	/** True when both `<plan>...</plan>` and `<expected>...</expected>` were present. */
+	declared: boolean;
 }
+
+/**
+ * Mutating tool names under the built-in tool set. Read-only batches
+ * (read/grep/find/ls) don't require an explicit declaration — there is no
+ * state to revise. A batch is treated as mutating if any of its tool calls
+ * is in this list. Callers can override via `isMutatingToolCall`.
+ */
+export const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set(["bash", "edit", "write"]);
 
 /** Session-like target for `appendDecision`. Use {@link createSchemaDecisionHooks} for the default. */
 export type DecisionRecorder = Pick<SessionManager, "appendDecision">;
@@ -58,7 +70,13 @@ export interface SchemaDecisionHooks {
 }
 
 export interface SchemaDecisionHooksOptions {
-	/** Extract plan from the assistant message text. Default: first text block, truncated to 1000 chars. */
+	/**
+	 * Extract the agent's declared plan. The default recognizes an explicit
+	 * `<plan>...</plan>` block in the assistant's text; if absent it falls back
+	 * to the first text block so the Timeline still has a usable record. The
+	 * `declared` flag passed downstream is only set when BOTH `<plan>` and
+	 * `<expected>` blocks are present (see {@link requireDeclarations}).
+	 */
 	planExtractor?: (message: AssistantMessage) => string;
 	/**
 	 * Extract an explicit expected-outcome declaration. The default ONLY
@@ -76,6 +94,21 @@ export interface SchemaDecisionHooksOptions {
 	failureThreshold?: "any_error" | "majority_error" | "all_error";
 	/** Maximum number of concurrent in-flight plans kept in memory. Default: 64. */
 	maxPendingPlans?: number;
+	/**
+	 * Classify a single tool-call name as mutating. Default checks against
+	 * {@link MUTATING_TOOL_NAMES}. Override only if you register custom tools
+	 * that mutate state.
+	 */
+	isMutatingToolCall?: (toolName: string) => boolean;
+	/**
+	 * Whether mutating batches must carry an explicit declaration
+	 * (`<plan>...</plan>` + `<expected>...</expected>`). Default: true
+	 * (Schema's "deliberation before action" principle). When enabled and the
+	 * declaration is missing, the batch is treated as a `failure` and a
+	 * dedicated revision prompt asks the agent to declare first before acting.
+	 * Set to false to record decisions quietly without enforcement.
+	 */
+	requireDeclarations?: boolean;
 	/**
 	 * Called with the persisted `DecisionEntry` id once `afterToolBatch` writes
 	 * the decision. Use to surface live decision entries to the UI (e.g. emit
@@ -104,8 +137,11 @@ export function createSchemaDecisionHooks(
 	const outcomeSummarizer = options?.outcomeSummarizer ?? defaultOutcomeSummarizer;
 	const failureThreshold = options?.failureThreshold ?? "any_error";
 	const maxPendingPlans = options?.maxPendingPlans ?? 64;
+	const isMutatingToolCall = options?.isMutatingToolCall ?? defaultIsMutatingToolCall;
+	const requireDeclarations = options?.requireDeclarations ?? true;
 
 	const pendingPlans = new Map<string, DecisionPlanId>();
+	const declarationMissingPlanIds = new Set<string>();
 	const onDecisionAppended = options?.onDecisionAppended;
 
 	const beforeToolBatch: SchemaDecisionHooks["beforeToolBatch"] = async ({ assistantMessage, toolCalls }) => {
@@ -113,8 +149,13 @@ export function createSchemaDecisionHooks(
 		const expected = expectedExtractor(assistantMessage);
 		const label = labelFormatter(toolCalls.map((tc) => tc.name));
 		const planId = uuidv7();
+		const mutating = toolCalls.some((tc) => isMutatingToolCall(tc.name));
+		// Both explicit blocks must be present for the declaration to count.
+		// `(unverified)`/`(undeclared)` markers come straight out of the
+		// extractors when their respective block is missing.
+		const declared = plan !== UNDECLARED_PLAN && expected !== UNVERIFIED_EXPECTED;
 
-		const entry: DecisionPlanId = { planId, label, plan, expected };
+		const entry: DecisionPlanId = { planId, label, plan, expected, mutating, declared };
 		pendingPlans.set(planId, entry);
 		for (const key of pendingPlans.keys()) {
 			if (pendingPlans.size <= maxPendingPlans) break;
@@ -131,15 +172,23 @@ export function createSchemaDecisionHooks(
 
 	const afterToolBatch: SchemaDecisionHooks["afterToolBatch"] = async ({ planId, toolResults, hasErrors }) => {
 		const actual = outcomeSummarizer(toolResults);
-		const outcome = classifyOutcome(hasErrors, toolResults.length, failureThreshold);
-
 		const planEntry = pendingPlans.get(planId) ?? {
 			planId,
 			label: "(unknown)",
-			plan: "",
-			expected: "(unverified)",
+			plan: UNDECLARED_PLAN,
+			expected: UNVERIFIED_EXPECTED,
+			mutating: true,
+			declared: false,
 		};
 		pendingPlans.delete(planId);
+
+		// Declaration gate: a mutating batch without explicit `<plan>` +
+		// `<expected>` is treated as a failure regardless of hasErrors, and
+		// the revision prompt asks for a declaration rather than a model
+		// revision. This is the Schema "deliberation before action" principle.
+		const missingDeclaration = requireDeclarations && planEntry.mutating && !planEntry.declared;
+		const outcome = missingDeclaration ? "failure" : classifyOutcome(hasErrors, toolResults.length, failureThreshold);
+		const revisionRequired = outcome === "failure";
 
 		const record: DecisionRecord = {
 			planId,
@@ -147,25 +196,44 @@ export function createSchemaDecisionHooks(
 			plan: planEntry.plan,
 			expected: planEntry.expected,
 			actual,
-			outcome,
+			outcome: missingDeclaration ? "failure" : outcome,
+			revision: missingDeclaration ? UNDECLARED_REVISION : undefined,
 		};
 		const entryId = session.appendDecision(record);
+		if (missingDeclaration) {
+			declarationMissingPlanIds.add(planId);
+			// Keep the set bounded — reuse the same cap as pendingPlans.
+			if (declarationMissingPlanIds.size > maxPendingPlans) {
+				const first = declarationMissingPlanIds.values().next().value;
+				if (first !== undefined) declarationMissingPlanIds.delete(first);
+			}
+		}
 		try {
 			onDecisionAppended?.(entryId);
 		} catch {
 			// listener failures must not break the agent loop
 		}
 
-		const revisionRequired = outcome === "failure";
 		return {
 			actual,
 			outcome,
 			revisionRequired,
-			revision: revisionRequired ? buildRevisionSummary(planEntry, actual) : undefined,
+			revision: revisionRequired
+				? missingDeclaration
+					? buildDeclarationRequiredSummary(planEntry)
+					: buildRevisionSummary(planEntry, actual)
+				: undefined,
 		} satisfies AfterToolBatchResult;
 	};
 
-	const onModelRevision: SchemaDecisionHooks["onModelRevision"] = async ({ plan, expected, actual }) => {
+	const onModelRevision: SchemaDecisionHooks["onModelRevision"] = async ({ planId, plan, expected, actual }) => {
+		// afterToolBatch has already deleted the pendingPlan entry, so we
+		// route through the declaration-missing set instead; that's how the
+		// "missing declaration" verdict survives the after→revision step.
+		if (requireDeclarations && declarationMissingPlanIds.has(planId)) {
+			declarationMissingPlanIds.delete(planId);
+			return buildDeclarationRequiredMessage();
+		}
 		return buildRevisionMessage(plan, expected, actual);
 	};
 
@@ -196,10 +264,22 @@ function noopRecorder(): string {
 	return "";
 }
 
-/** Default plan extractor: first text block in assistant message, capped. */
+/** Sentinel string recorded for `plan` when the assistant gave no explicit `<plan>` block. */
+const UNDECLARED_PLAN = "(undeclared)";
+/** Sentinel string recorded for `expected` when the assistant gave no explicit `<expected>` block. */
+const UNVERIFIED_EXPECTED = "(unverified)";
+/** Sentinel string recorded as `revision` when the batch was rejected for missing a declaration. */
+const UNDECLARED_REVISION = "missing <plan>/<expected> declaration";
+
+/** Default plan extractor: recognizes an explicit `<plan>...</plan>` block, else records `(undeclared)`. */
 function defaultPlanExtractor(message: AssistantMessage): string {
-	const text = firstTextBlock(message);
-	return text ? text.slice(0, 1000) : "(no plan declared)";
+	const text = firstTextBlock(message) ?? "";
+	const match = text.match(/<plan>([\s\S]*?)<\/plan>/i);
+	if (match) return match[1].trim().slice(0, 1000) || UNDECLARED_PLAN;
+	// Fall back to the first text block so a misbehaving agent still leaves a
+	// usable record in the Timeline; `declared` is computed separately and
+	// will still be false, so enforcement kicks in.
+	return text.slice(0, 1000) ? text.slice(0, 1000) : UNDECLARED_PLAN;
 }
 
 /**
@@ -260,6 +340,45 @@ function classifyOutcome(
 function buildRevisionSummary(plan: DecisionPlanId, actual: string): string {
 	return `Decision "${plan.label}" failed. Expected success but encountered errors.Actual outcome: ${actual}`;
 }
+
+/** Stub summary embedded in the `AfterToolBatchResult.revision` for declaration-missing batches. */
+function buildDeclarationRequiredSummary(plan: DecisionPlanId): string {
+	return `Decision "${plan.label}" was rejected: mutating batches must carry an explicit <plan>...</plan> + <expected>...</expected> declaration. none was found.`;
+}
+
+/** Full revision prompt injected into context when a mutating batch was sent without a declaration. */
+function buildDeclarationRequiredMessage(): string {
+	return [
+		"## Declaration Required Before Mutating Actions",
+		"",
+		"Your previous tool batch would mutate files or run stateful commands, but it did not include an explicit plan. Premise of deliberation before action: state what you intend and what you expect, *then* act.",
+		"",
+		"Before any batch that includes `bash`, `edit`, or `write`, your preceding text MUST contain BOTH:",
+		"  - `<plan> ... </plan>` — a short description of the action(s) you intend, and",
+		"  - `<expected> ... </expected>` — the observable outcome you will use to certify success (command exit code, file contents, test result, etc.).",
+		"",
+		"Re-issue your previous tool calls with those two blocks included. Do not retry the mutation without them.",
+	].join("\n");
+}
+
+/** Whether a tool name is on the built-in mutating set. Override via `options.isMutatingToolCall`. */
+function defaultIsMutatingToolCall(toolName: string): boolean {
+	return MUTATING_TOOL_NAMES.has(toolName);
+}
+
+/**
+ * Short system-prompt convention block teaching the agent the
+ * `<plan>...</plan>` + `<expected>...</expected>` requirement. Appended to
+ * the system prompt once per turn while schema tracking is enabled.
+ */
+export const SCHEMA_DECLARATION_CONVENTION = [
+	"<schema_declaration_convention>",
+	"Before any tool batch that mutates state (bash, edit, write), your preceding text MUST include BOTH:",
+	"  - <plan> ... </plan>   — what you intend to do in this batch",
+	"  - <expected> ... </expected> — the observable outcome you will use to certify success",
+	"A mutating batch without both blocks will be rejected and you will be asked to declare before retrying.",
+	"</schema_declaration_convention>",
+].join("\n");
 
 function buildRevisionMessage(plan: string, expected: string, actual: string): string {
 	return [
