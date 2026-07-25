@@ -434,4 +434,89 @@ describe("Schema Decision Tracking", () => {
 			expect(result.details.total).toBe(0);
 		});
 	});
+
+	describe("persistence-gated escalation (P3)", () => {
+		async function planRunWithOutcome(
+			hooks: ReturnType<typeof createSchemaDecisionHooks>,
+			assistant: AssistantMessage,
+			planText: string,
+			hasErrors: boolean,
+		): Promise<{ planId: string; revision?: string }> {
+			const fullAssistant = makeAssistantMessage(`<plan>${planText}</plan>\n<expected>success</expected>`);
+			// Reuse the assistant argument — the extractor only needs its `.content`.
+			void assistant;
+			const before = await hooks.beforeToolBatch({
+				assistantMessage: fullAssistant,
+				toolCalls: [makeToolCall("edit")],
+				context: EMPTY_CONTEXT,
+			});
+			const result = await hooks.afterToolBatch({
+				assistantMessage: fullAssistant,
+				planId: before!.planId,
+				toolResults: [makeToolResult(hasErrors ? "Error!" : "done")],
+				hasErrors,
+				context: EMPTY_CONTEXT,
+			});
+			// Only consult onModelRevision when the loop actually would (i.e. when
+			// afterToolBatch said revision was required). On a successful batch the
+			// loop short-circuits and never calls onModelRevision.
+			let revision: string | undefined;
+			if (result?.revisionRequired) {
+				revision = await hooks.onModelRevision({
+					planId: before!.planId,
+					plan: planText,
+					expected: "success",
+					actual: result!.actual,
+					toolResults: [],
+					context: EMPTY_CONTEXT,
+				});
+			}
+			return { planId: before!.planId, revision };
+		}
+
+		it("returns the standard revision prompt on the first failure", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm);
+			const { revision } = await planRunWithOutcome(hooks, makeAssistantMessage(""), "fix import a", true);
+			expect(revision).toContain("Model Revision Required");
+			expect(revision).toContain("Answer these questions");
+			expect(revision).not.toContain("Persistent Model Failure");
+		});
+
+		it("escalates to the reproducer-first prompt after escalationThreshold same-shape failures", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm, { escalationThreshold: 2 });
+			// First failure on this shape: standard prompt.
+			const r1 = await planRunWithOutcome(hooks, makeAssistantMessage(""), "fix import a", true);
+			expect(r1.revision).toContain("Model Revision Required");
+			// Second failure on the same (canonicalized) shape: escalation.
+			const r2 = await planRunWithOutcome(hooks, makeAssistantMessage(""), "Fix import a.", true);
+			expect(r2.revision).toContain("Persistent Model Failure");
+			expect(r2.revision).toContain("minimal reproducer");
+			expect(r2.revision).toContain("2x");
+		});
+
+		it("resets the streak after a success on the same shape", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm, { escalationThreshold: 2 });
+			await planRunWithOutcome(hooks, makeAssistantMessage(""), "fix import a", true);
+			// Success on the same shape resets the streak.
+			const success = await planRunWithOutcome(hooks, makeAssistantMessage(""), "fix import a", false);
+			expect(success.revision).toBeUndefined();
+			// First failure again: standard prompt, no escalation.
+			const r3 = await planRunWithOutcome(hooks, makeAssistantMessage(""), "fix import a", true);
+			expect(r3.revision).toContain("Model Revision Required");
+			expect(r3.revision).not.toContain("Persistent Model Failure");
+		});
+
+		it("does not escalate when escalationThreshold is 0", async () => {
+			const sm = SessionManager.inMemory();
+			const hooks = createSchemaDecisionHooks(sm, { escalationThreshold: 0 });
+			await planRunWithOutcome(hooks, makeAssistantMessage(""), "fix import a", true);
+			await planRunWithOutcome(hooks, makeAssistantMessage(""), "fix import a", true);
+			const r3 = await planRunWithOutcome(hooks, makeAssistantMessage(""), "fix import a", true);
+			expect(r3.revision).toContain("Model Revision Required");
+			expect(r3.revision).not.toContain("Persistent Model Failure");
+		});
+	});
 });

@@ -110,6 +110,22 @@ export interface SchemaDecisionHooksOptions {
 	 */
 	requireDeclarations?: boolean;
 	/**
+	 * Canonicalize a plan string into a streak key. The default lowercases,
+	 * strips non-alphanumeric characters, and clips to 100 chars so two
+	 * near-identical plans (varying only in punctuation or slice of wording)
+	 * are treated as the same shape for persistence-gated escalation.
+	 */
+	normalizePlanShape?: (plan: string) => string;
+	/**
+	 * At-or-above how many consecutive same-shape failures before
+	 * `onModelRevision` escalates from the standard revision questions to the
+	 * "produce a minimal reproducer before retrying" prompt. Default: 2 —
+	 * Schema's "persistent failure" cut-off. Set to a higher value to make
+	 * the agent answer the questions more times before escalation; 0 disables
+	 * escalation entirely.
+	 */
+	escalationThreshold?: number;
+	/**
 	 * Called with the persisted `DecisionEntry` id once `afterToolBatch` writes
 	 * the decision. Use to surface live decision entries to the UI (e.g. emit
 	 * `entry_appended` so tree-selector re-renders). Best-effort: errors here
@@ -139,9 +155,22 @@ export function createSchemaDecisionHooks(
 	const maxPendingPlans = options?.maxPendingPlans ?? 64;
 	const isMutatingToolCall = options?.isMutatingToolCall ?? defaultIsMutatingToolCall;
 	const requireDeclarations = options?.requireDeclarations ?? true;
+	const normalizePlanShape = options?.normalizePlanShape ?? defaultNormalizePlanShape;
+	const escalationThreshold = options?.escalationThreshold ?? 2;
 
 	const pendingPlans = new Map<string, DecisionPlanId>();
 	const declarationMissingPlanIds = new Set<string>();
+	/**
+	 * Per-plan-shape consecutive failure streak. Schema's "persistent failure"
+	 * notion: counter increments on each failed batch with the same shape and
+	 * resets on the first success for that shape. Surfaced through
+	 * `pendingRevisionShapeByPlanId` to onModelRevision so the iteration step
+	 * knows whether to ask the four questions (1st failure) or escalate to the
+	 * reproducer-first prompt.
+	 */
+	const consecutiveFailuresByShape = new Map<string, number>();
+	/** Map planId → just-recorded shape for onModelRevision to consult. */
+	const pendingRevisionShapeByPlanId = new Map<string, string>();
 	const onDecisionAppended = options?.onDecisionAppended;
 
 	const beforeToolBatch: SchemaDecisionHooks["beforeToolBatch"] = async ({ assistantMessage, toolCalls }) => {
@@ -208,6 +237,28 @@ export function createSchemaDecisionHooks(
 				if (first !== undefined) declarationMissingPlanIds.delete(first);
 			}
 		}
+
+		// Persistence-gated streak tracking. A declared mutating failure (or
+		// any failed batch when declarations are off) increments the
+		// consecutive-failure counter keyed by the canonicalized plan shape;
+		// any success on the same shape resets it. The latest shape for this
+		// planId is stashed so onModelRevision (called after
+		// pendingPlans.delete) can decide between the question prompt and the
+		// reproducer-first escalation prompt.
+		if (!missingDeclaration) {
+			const shape = normalizePlanShape(planEntry.plan);
+			if (outcome === "success") {
+				consecutiveFailuresByShape.delete(shape);
+			} else if (revisionRequired) {
+				const next = (consecutiveFailuresByShape.get(shape) ?? 0) + 1;
+				consecutiveFailuresByShape.set(shape, next);
+				pendingRevisionShapeByPlanId.set(planId, shape);
+				if (pendingRevisionShapeByPlanId.size > maxPendingPlans) {
+					const first = pendingRevisionShapeByPlanId.keys().next().value;
+					if (first !== undefined) pendingRevisionShapeByPlanId.delete(first);
+				}
+			}
+		}
 		try {
 			onDecisionAppended?.(entryId);
 		} catch {
@@ -233,6 +284,16 @@ export function createSchemaDecisionHooks(
 		if (requireDeclarations && declarationMissingPlanIds.has(planId)) {
 			declarationMissingPlanIds.delete(planId);
 			return buildDeclarationRequiredMessage();
+		}
+		// Persistence-gated escalation: at the Nth consecutive same-shape
+		// failure the four questions stop being enough — Schema's premise is
+		// that persistent failure indicts the representation, so demand a
+		// minimal reproducer / probe before any further retry.
+		const shape = pendingRevisionShapeByPlanId.get(planId) ?? normalizePlanShape(plan);
+		pendingRevisionShapeByPlanId.delete(planId);
+		const streak = consecutiveFailuresByShape.get(shape) ?? 0;
+		if (escalationThreshold > 0 && streak >= escalationThreshold) {
+			return buildEscalationMessage(plan, expected, actual, streak);
 		}
 		return buildRevisionMessage(plan, expected, actual);
 	};
@@ -398,6 +459,47 @@ function buildRevisionMessage(plan: string, expected: string, actual: string): s
 		"",
 		"Do NOT proceed with another attempt until you have answered these questions.",
 	].join("\n");
+}
+
+/**
+ * Escalation prompt used after `escalationThreshold` consecutive failures on
+ * the same plan shape. Schema's premise: persistent failure indicts the
+ * representation, not just the rule, so before any further retry the agent
+ * must produce a minimal probe (a test, a one-liner, or just-below-the-load
+ * reproducer) that establishes the actual behavior.
+ */
+function buildEscalationMessage(plan: string, expected: string, actual: string, streak: number): string {
+	return [
+		`## Persistent Model Failure (${streak}x same plan shape)`,
+		"",
+		"Your previous plan has now failed this many times with the same shape. Continuing to retry it with minor wording changes will keep failing. Before your next attempt you must produce a minimal reproducer:",
+		"",
+		"- Write a tiny test, a one-line shell command, or the smallest input that reproduces the failure you just observed.",
+		"- Run it and paste the *actual* output (not what you expected).",
+		"- Only after the reproducer agrees with the recorded actual may you re-issue your plan — and you must edit your stated `<expected>` to match what the reproducer showed.",
+		"",
+		"If you cannot build a reproducer, you do not yet understand the mechanism; say so and ask the user instead of retrying.",
+		"",
+		`**Plan (last):** ${plan.slice(0, 600)}`,
+		`**Expected (last):** ${expected.slice(0, 400)}`,
+		`**Actual (last):** ${actual.slice(0, 600)}`,
+	].join("\n");
+}
+
+/**
+ * Canonicalize a plan string into a streak key. Lowercases, strips every
+ * non-alphanumeric character, and clips to 100 chars so near-identical plans
+ * (punctuation wording differences, trailing whitespace) hash the same. Used
+ * so the persistence-gated escalation counter only trips when the agent
+ * keeps failing on effectively the same plan.
+ */
+function defaultNormalizePlanShape(plan: string): string {
+	const cleaned = plan
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, " ")
+		.trim()
+		.slice(0, 100);
+	return cleaned || "(empty)";
 }
 
 function firstTextBlock(message: AssistantMessage): string | undefined {
