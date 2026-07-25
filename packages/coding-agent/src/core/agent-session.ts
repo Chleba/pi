@@ -1154,7 +1154,10 @@ export class AgentSession {
 		}
 
 		// Auto-continuation: if the agent declared plan/expected but included
-		// no tool calls, queue a follow-up to nudge it to actually act.
+		// no tool calls, check whether it indicates completion. Only nag
+		// when the agent clearly intends to continue working (no completion
+		// signals). Plan/expected without tool calls is valid when the agent
+		// is genuinely done — it should not be forced to produce tool calls.
 		if (
 			isSchemaDecisionTrackingEnabled() &&
 			msg.content.some((c) => c.type === "text") &&
@@ -1163,13 +1166,23 @@ export class AgentSession {
 			const textBlock = msg.content.find((c): c is TextContent => c.type === "text");
 			const text = textBlock?.text ?? "";
 			if (/<plan>/i.test(text) && /<expected>/i.test(text)) {
-				this.agent.followUp({
-					role: "user",
-					content:
-						"You declared your plan but did not include any tool calls. Re-issue your tool calls now with the declaration tags in the same response.",
-					timestamp: Date.now(),
-				});
-				return true;
+				// Check for completion signals — if present, the agent is
+				// genuinely done and should not be auto-continued.
+				const hasCompletionSignal =
+					/\b(d|D)one\b/.test(text) ||
+					/\b(c|C)omplete\b/.test(text) ||
+					/\b(r|R)eady\b/.test(text) ||
+					/\b(m|M)oving\s+on\b/.test(text) ||
+					/\b(next\s+step)\b/i.test(text);
+				if (!hasCompletionSignal) {
+					this.agent.followUp({
+						role: "user",
+						content:
+							"You declared your plan but did not include any tool calls. Re-issue your tool calls now with the declaration tags in the same response.",
+						timestamp: Date.now(),
+					});
+					return true;
+				}
 			}
 		}
 

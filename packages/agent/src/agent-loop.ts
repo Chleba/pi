@@ -205,32 +205,35 @@ async function runLoop(
 
 			const toolResults: ToolResultMessage[] = [];
 			hasMoreToolCalls = false;
-			if (toolCalls.length > 0) {
-				// beforeToolBatch hook — capture the agent's declared plan and
-				// expected outcome before execution (Schema-inspired: deliberation).
-				let batchPlanId: string | undefined;
-				let batchPlan: string | undefined;
-				let batchExpected: string | undefined;
-				if (config.beforeToolBatch) {
-					try {
-						const batchPrep = await config.beforeToolBatch(
-							{
-								assistantMessage: message,
-								toolCalls,
-								context: currentContext,
-							},
-							signal,
-						);
-						if (batchPrep) {
-							batchPlanId = batchPrep.planId;
-							batchPlan = batchPrep.plan;
-							batchExpected = batchPrep.expected;
-						}
-					} catch {
-						// Hook failure is non-fatal — continue with execution
-					}
-				}
 
+			// beforeToolBatch hook — capture the agent's declared plan and
+			// expected outcome before execution (Schema-inspired: deliberation).
+			// Fires for every assistant message so plan/expected are recorded
+			// even when the agent produces no tool calls.
+			let batchPlanId: string | undefined;
+			let batchPlan: string | undefined;
+			let batchExpected: string | undefined;
+			if (config.beforeToolBatch) {
+				try {
+					const batchPrep = await config.beforeToolBatch(
+						{
+							assistantMessage: message,
+							toolCalls,
+							context: currentContext,
+						},
+						signal,
+					);
+					if (batchPrep) {
+						batchPlanId = batchPrep.planId;
+						batchPlan = batchPrep.plan;
+						batchExpected = batchPrep.expected;
+					}
+				} catch {
+					// Hook failure is non-fatal
+				}
+			}
+
+			if (toolCalls.length > 0) {
 				// A "length" stop means the output was cut off by the token limit, so
 				// every tool call in the message may carry truncated arguments. Fail
 				// them all instead of executing potentially borked calls.
@@ -300,6 +303,25 @@ async function runLoop(
 					newMessages.push(revisionMsg);
 					// Force another turn so the agent can revise its model
 					hasMoreToolCalls = true;
+				}
+			} else if (config.afterToolBatch) {
+				// No tool calls — still record a decision entry so plan/expected
+				// are captured in the Timeline. The hooks classify this as
+				// success (no errors, no mutations) unless the agent declared
+				// intent to mutate without a declaration.
+				try {
+					await config.afterToolBatch(
+						{
+							assistantMessage: message,
+							planId: batchPlanId ?? "",
+							toolResults: [],
+							hasErrors: false,
+							context: currentContext,
+						},
+						signal,
+					);
+				} catch {
+					// Hook failure is non-fatal
 				}
 			}
 
