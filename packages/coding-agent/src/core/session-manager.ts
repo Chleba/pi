@@ -115,27 +115,56 @@ export interface LabelEntry extends SessionEntryBase {
 }
 
 /**
- * Decision log entry — structured record of what the agent planned, expected,
- * and what actually happened. Inspired by Schema's immutable Timeline.
+ * Decision log entry — append-only, immutable record of one round of
+ * deliberation produced by the schema-inspired decision hooks.
  *
- * Does NOT participate in LLM context (ignored by buildSessionContext).
- * Use for post-mortem analysis and structured decision tracking.
+ * Written ONCE per tool batch: the hooks accumulate plan/expected in memory
+ * during `beforeToolBatch` and call `appendDecision` only after `afterToolBatch`
+ * has the outcome. There is no in-place update path — Schema's Timeline is
+ * append-only precisely so that observations can be diffed later without
+ * worrying about edits corrupting history, and so file persistence stays
+ * O(1) per batch.
+ *
+ * Does NOT participate in LLM context directly; the agent learns about past
+ * decisions via the recent-decisions digest injected into the system prompt
+ * (see `getRecentDecisionsDigest`) and via the dedicated `decisions` tool.
  */
 export interface DecisionEntry extends SessionEntryBase {
 	type: "decision";
-	/** Human-readable label for the decision. */
+	/** Stable handle linking `beforeToolBatch` and `afterToolBatch`. Stored in `metadata.planId`. */
+	/** Human-readable label (e.g. tool names) for the decision. */
+	label: string;
+	/** What the agent planned to do. */
+	plan: string;
+	/** What the agent expected to happen as a result. */
+	expected: string;
+	/** What actually happened. */
+	actual?: string;
+	/** Outcome classification. */
+	outcome?: "success" | "failure" | "partial";
+	/** Structured revision notes — what the agent learned / how its model changed. */
+	revision?: string;
+	/** Optional metadata (file paths, tool names, planId, etc.). */
+	metadata?: Record<string, unknown>;
+}
+
+/** Input shape for {@link SessionManager.appendDecision}. */
+export interface DecisionRecord {
+	/** Stable handle linking before/after hooks. Stored in `metadata.planId`. */
+	planId: string;
+	/** Human-readable label (e.g. joined tool names) for the decision. */
 	label: string;
 	/** What the agent planned to do. */
 	plan: string;
 	/** What the agent expected to happen. */
 	expected: string;
-	/** What actually happened (filled in after execution). */
+	/** What actually happened. */
 	actual?: string;
 	/** Outcome classification. */
 	outcome?: "success" | "failure" | "partial";
 	/** Structured revision notes. */
 	revision?: string;
-	/** Optional metadata. */
+	/** Optional metadata (file paths, tool names, etc.). */
 	metadata?: Record<string, unknown>;
 }
 
@@ -1074,23 +1103,6 @@ export class SessionManager {
 		this._persist(entry);
 	}
 
-	private _updateEntry(entry: SessionEntry): void {
-		const idx = this.fileEntries.findIndex((e) => e.id === entry.id);
-		if (idx === -1) return;
-		this.fileEntries[idx] = entry;
-		this.byId.set(entry.id, entry);
-		// Rewrite the entire file since we modified an existing entry
-		if (!this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
-		try {
-			for (const e of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(e)}\n`);
-			}
-		} finally {
-			closeSync(fd);
-		}
-	}
-
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
 	 * Does not allow writing CompactionSummaryMessage and BranchSummaryMessage directly.
 	 * Reason: we want these to be top-level entries in the session, not message session entries,
@@ -1236,57 +1248,36 @@ export class SessionManager {
 	// =========================================================================
 
 	/**
-	 * Append a decision log entry. Records what the agent planned before acting.
-	 * See schema-decisions.ts for the full decision tracking pattern.
-	 * @param label Human-readable label
-	 * @param plan What the agent planned to do
-	 * @param expected What the agent expected to happen
-	 * @returns Entry id
+	 * Append a decision log entry — append-only, written once per tool batch.
+	 * The hooks in `schema-decisions.ts` accumulate plan/expected in memory
+	 * during `beforeToolBatch` and only call this after `afterToolBatch` knows
+	 * the outcome. There is no in-place update: Schema's Timeline is append-only
+	 * so observations stay immutable and file persistence stays O(1) per batch.
 	 */
-	appendDecision(label: string, plan: string, expected: string, metadata?: Record<string, unknown>): string {
+	appendDecision(record: DecisionRecord): string {
+		const { planId, label, plan, expected, actual, outcome, revision, metadata } = record;
 		const entry: DecisionEntry = {
 			type: "decision",
 			label,
 			plan,
 			expected,
+			actual,
+			outcome,
+			revision,
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
-			metadata,
+			metadata: { planId, ...(metadata ?? {}) },
 		};
 		this._appendEntry(entry);
 		return entry.id;
 	}
 
 	/**
-	 * Update an existing decision entry with actual outcome.
-	 * @param entryId The decision entry id to update
-	 * @param actual What actually happened
-	 * @param outcome Outcome classification
-	 * @param revision Optional revision notes
-	 */
-	updateDecision(
-		entryId: string,
-		actual: string,
-		outcome: "success" | "failure" | "partial",
-		revision?: string,
-	): void {
-		const entry = this.byId.get(entryId);
-		if (!entry || entry.type !== "decision") return;
-		const decision = entry as DecisionEntry;
-		decision.actual = actual;
-		decision.outcome = outcome;
-		if (revision !== undefined) decision.revision = revision;
-		// Re-append to file with updated data
-		this._updateEntry(decision);
-	}
-
-	/**
-	 * Get all decision entries in the session, ordered by timestamp.
+	 * Get all decision entries in the session, ordered by append (oldest first).
 	 */
 	getDecisions(): DecisionEntry[] {
-		const entries = this.getEntries();
-		return entries.filter((e) => e.type === "decision") as DecisionEntry[];
+		return this.getEntries().filter((e) => e.type === "decision") as DecisionEntry[];
 	}
 
 	/**
@@ -1295,6 +1286,34 @@ export class SessionManager {
 	getDecision(id: string): DecisionEntry | undefined {
 		const entry = this.byId.get(id);
 		return entry?.type === "decision" ? (entry as DecisionEntry) : undefined;
+	}
+
+	/**
+	 * Compact digest of the most recent decisions for system-prompt injection
+	 * (the LLM-visible half of the Timeline). Only failed or partial decisions
+	 * are surfaced — successes add noise and offer no revision value. Fewer
+	 * than `limit` entries are returned so sessions without failures stay quiet.
+	 */
+	getRecentDecisionsDigest(limit = 5): string {
+		const decisions = this.getEntries()
+			.filter((e): e is DecisionEntry => e.type === "decision")
+			.filter((e) => e.outcome === "failure" || e.outcome === "partial")
+			.slice(-limit)
+			.reverse();
+		if (decisions.length === 0) return "";
+		const lines = decisions.map((d, i) => {
+			const tag = d.outcome === "failure" ? "failure" : "partial";
+			const expected = d.expected && d.expected !== "(unverified)" ? d.expected.slice(0, 200) : "(declared)";
+			const actual = d.actual ? d.actual.slice(0, 200) : "(none)";
+			const revision = d.revision ? `\n      Revision: ${d.revision.slice(0, 200)}` : "";
+			return `  ${i + 1}. [${tag}] ${d.label}\n      Plan: ${d.plan.slice(0, 200)}\n      Expected: ${expected}\n      Actual: ${actual}${revision}`;
+		});
+		return [
+			"<recent_decisions>",
+			"Recent batches where your plan did not match the outcome. Revise your mental model before retrying any similar plan:",
+			lines.join("\n"),
+			"</recent_decisions>",
+		].join("\n");
 	}
 
 	// =========================================================================

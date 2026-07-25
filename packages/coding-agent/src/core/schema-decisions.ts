@@ -4,15 +4,25 @@
  * Inspired by the Schema harness (schema-harness.github.io) which achieves
  * ~99% on ARC-AGI-3 by forcing models to:
  * 1. Encode beliefs as executable programs (not implicit context)
- * 2. Validate against every recorded transition (run_backtest)
+ * 2. Validate against every recorded transition (certify phase)
  * 3. Plan inside a verified simulator (free planning)
  * 4. Maintain an append-only Timeline (immutable observations)
  *
- * This module provides structured decision log support:
- * - Record what the agent planned, expected, and what actually happened
- * - Detect mismatches between plan and outcome
- * - Force explicit model revision on failure
- * - Enable post-mortem analysis of agent behavior
+ * This module wires that pattern to the pi agent loop with three hooks:
+ *
+ * - `beforeToolBatch`: capture the assistant's declared plan/expected in
+ *   memory (the "deliberation" snapshot). Returns a `planId` that is passed
+ *   through the loop so `afterToolBatch` knows which plan to record.
+ * - `afterToolBatch`: classify the outcome using the loop-provided `hasErrors`
+ *   flag (the canonical error signal — never text-matched from raw output),
+ *   then write ONE `DecisionEntry` with the full plan/expected/actual/outcome.
+ * - `onModelRevision`: when a batch fails, produce a revision prompt the loop
+ *   injects as a custom message (`schema_revision`) so revision artifacts stay
+ *   separate from user/assistant history and don't pollute context.
+ *
+ * Decisions live in the Timeline (append-only JSONL) and the LLM-visible half
+ * of the Timeline is the recent-decisions digest injected into the system
+ * prompt each turn via `SessionManager.getRecentDecisionsDigest`.
  */
 
 import type {
@@ -23,74 +33,93 @@ import type {
 } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { uuidv7 } from "@earendil-works/pi-ai";
+import type { DecisionRecord, SessionManager } from "./session-manager.ts";
 
-/** Extract text blocks from an assistant message's content. */
-function getTextBlocks(message: AssistantMessage): string[] {
-	const textBlocks: string[] = [];
-	const content = message.content;
-	if (Array.isArray(content)) {
-		for (const block of content) {
-			if (block.type === "text") {
-				textBlocks.push(block.text);
-			}
-		}
-	}
-	return textBlocks;
-}
-
-/** A decision batch that links planning to outcomes. */
-export interface DecisionBatch {
+/** Stable handle for one round of deliberation; links `beforeToolBatch` to `afterToolBatch`. */
+export interface DecisionPlanId {
 	planId: string;
 	label: string;
 	plan: string;
 	expected: string;
-	actual?: string;
-	outcome?: "success" | "failure" | "partial";
-	revision?: string;
-	toolResults: AgentToolResult<any>[];
-	timestamp: string;
+}
+
+/** Session-like target for `appendDecision`. Use {@link createSchemaDecisionHooks} for the default. */
+export type DecisionRecorder = Pick<SessionManager, "appendDecision">;
+
+/**
+ * Full hook set. Returned by {@link createSchemaDecisionHooks} and assigned to
+ * the Agent's hook slots; also exported individually for advanced users who
+ * only want some of the three.
+ */
+export interface SchemaDecisionHooks {
+	beforeToolBatch: NonNullable<AgentLoopConfig["beforeToolBatch"]>;
+	afterToolBatch: NonNullable<AgentLoopConfig["afterToolBatch"]>;
+	onModelRevision: NonNullable<AgentLoopConfig["onModelRevision"]>;
+}
+
+export interface SchemaDecisionHooksOptions {
+	/** Extract plan from the assistant message text. Default: first text block, truncated to 1000 chars. */
+	planExtractor?: (message: AssistantMessage) => string;
+	/**
+	 * Extract an explicit expected-outcome declaration. The default ONLY
+	 * recognizes an explicit `<expected>...</expected>` block in the assistant's
+	 * text. If absent, `expected` is recorded as `"(unverified)"` rather than
+	 * silently mirrored from `plan` — that mirror is the bug the prior regex
+	 * had, because outcome classification then never noticed a real mismatch.
+	 */
+	expectedExtractor?: (message: AssistantMessage) => string;
+	/** Format a label from the tool call names. Default: joined with " + ". */
+	labelFormatter?: (toolNames: string[]) => string;
+	/** Summarize tool results into a human-readable actual. Default: first text from each, 240 chars. */
+	outcomeSummarizer?: (toolResults: AgentToolResult<any>[]) => string;
+	/** Threshold for classifying a batch as failure. Default: `"any_error"` (trusts `hasErrors`). */
+	failureThreshold?: "any_error" | "majority_error" | "all_error";
+	/** Maximum number of concurrent in-flight plans kept in memory. Default: 64. */
+	maxPendingPlans?: number;
+	/**
+	 * Called with the persisted `DecisionEntry` id once `afterToolBatch` writes
+	 * the decision. Use to surface live decision entries to the UI (e.g. emit
+	 * `entry_appended` so tree-selector re-renders). Best-effort: errors here
+	 * are ignored by the hooks.
+	 */
+	onDecisionAppended?: (entryId: string) => void;
 }
 
 /**
- * Create a beforeToolBatch hook that captures the agent's declared plan.
+ * Build the three schema-decision hooks around a session manager. This is the
+ * only entry point the coding agent uses; the individual `create*Hook`
+ * factories below are exported for callers who assemble their own partial sets.
  *
- * Extracts the plan from the assistant message content and creates a
- * decision entry that links to the outcome via planId.
- *
- * @param session - Session for appending decision entries
- * @param options - Configuration options
+ * The hooks stay stateful via a closure-bound `pendingPlans` map keyed by
+ * `planId`; this is deliberate — schema decision state must live outside the
+ * session (which is strictly append-only) until the outcome is known.
  */
-export function createBeforeToolBatchHook(
-	session: { appendDecision: (decision: Omit<DecisionBatch, "toolResults">) => Promise<void> },
-	options?: {
-		/** Extract plan from assistant message content. Default: first text block. */
-		planExtractor?: (message: AssistantMessage) => string;
-		/** Extract expected outcome from assistant message content. Default: second text block or same as plan. */
-		expectedExtractor?: (message: AssistantMessage) => string;
-		/** Label format function. Default: tool names. */
-		labelFormatter?: (toolCalls: string[]) => string;
-	},
-): NonNullable<AgentLoopConfig["beforeToolBatch"]> {
+export function createSchemaDecisionHooks(
+	session: DecisionRecorder,
+	options?: SchemaDecisionHooksOptions,
+): SchemaDecisionHooks {
 	const planExtractor = options?.planExtractor ?? defaultPlanExtractor;
 	const expectedExtractor = options?.expectedExtractor ?? defaultExpectedExtractor;
 	const labelFormatter = options?.labelFormatter ?? defaultLabelFormatter;
+	const outcomeSummarizer = options?.outcomeSummarizer ?? defaultOutcomeSummarizer;
+	const failureThreshold = options?.failureThreshold ?? "any_error";
+	const maxPendingPlans = options?.maxPendingPlans ?? 64;
 
-	return async ({ assistantMessage, toolCalls, context: _context }) => {
+	const pendingPlans = new Map<string, DecisionPlanId>();
+	const onDecisionAppended = options?.onDecisionAppended;
+
+	const beforeToolBatch: SchemaDecisionHooks["beforeToolBatch"] = async ({ assistantMessage, toolCalls }) => {
 		const plan = planExtractor(assistantMessage);
 		const expected = expectedExtractor(assistantMessage);
-		const toolNames = toolCalls.map((tc) => tc.name);
-		const label = labelFormatter(toolNames);
+		const label = labelFormatter(toolCalls.map((tc) => tc.name));
 		const planId = uuidv7();
 
-		const decision = {
-			planId,
-			label,
-			plan,
-			expected,
-			timestamp: new Date().toISOString(),
-		};
-
-		await session.appendDecision(decision);
+		const entry: DecisionPlanId = { planId, label, plan, expected };
+		pendingPlans.set(planId, entry);
+		for (const key of pendingPlans.keys()) {
+			if (pendingPlans.size <= maxPendingPlans) break;
+			pendingPlans.delete(key);
+		}
 
 		return {
 			planId,
@@ -99,113 +128,93 @@ export function createBeforeToolBatchHook(
 			expected,
 		} satisfies BeforeToolBatchResult;
 	};
-}
 
-/**
- * Create an afterToolBatch hook that records outcomes and detects mismatches.
- *
- * Compares actual outcomes against expected results. If there's a mismatch
- * and errors occurred, signals that model revision is required.
- *
- * @param session - Session for appending decision entries
- * @param options - Configuration options
- */
-export function createAfterToolBatchHook(
-	session: {
-		updateDecision: (planId: string, actual: string, outcome: "success" | "failure" | "partial") => Promise<void>;
-	},
-	options?: {
-		/** Summarize tool results into a human-readable string. */
-		outcomeSummarizer?: (toolResults: AgentToolResult<any>[]) => string;
-		/** Threshold for considering a batch a "failure". Default: any error. */
-		failureThreshold?: "any_error" | "majority_error" | "all_error";
-	},
-): NonNullable<AgentLoopConfig["afterToolBatch"]> {
-	const outcomeSummarizer = options?.outcomeSummarizer ?? defaultOutcomeSummarizer;
-	const failureThreshold = options?.failureThreshold ?? "any_error";
-
-	return async ({ planId, toolResults, hasErrors, context: _context }) => {
+	const afterToolBatch: SchemaDecisionHooks["afterToolBatch"] = async ({ planId, toolResults, hasErrors }) => {
 		const actual = outcomeSummarizer(toolResults);
-		const outcome = classifyOutcome(toolResults, hasErrors, failureThreshold);
+		const outcome = classifyOutcome(hasErrors, toolResults.length, failureThreshold);
 
-		await session.updateDecision(planId, actual, outcome);
+		const planEntry = pendingPlans.get(planId) ?? {
+			planId,
+			label: "(unknown)",
+			plan: "",
+			expected: "(unverified)",
+		};
+		pendingPlans.delete(planId);
+
+		const record: DecisionRecord = {
+			planId,
+			label: planEntry.label,
+			plan: planEntry.plan,
+			expected: planEntry.expected,
+			actual,
+			outcome,
+		};
+		const entryId = session.appendDecision(record);
+		try {
+			onDecisionAppended?.(entryId);
+		} catch {
+			// listener failures must not break the agent loop
+		}
 
 		const revisionRequired = outcome === "failure";
-
 		return {
 			actual,
 			outcome,
 			revisionRequired,
-			revision:
-				outcome === "failure"
-					? `Decision "${planId}" failed. Expected success but encountered errors.\nActual outcome: ${actual}\n\nRevise your mental model of the codebase before retrying.`
-					: undefined,
+			revision: revisionRequired ? buildRevisionSummary(planEntry, actual) : undefined,
 		} satisfies AfterToolBatchResult;
 	};
+
+	const onModelRevision: SchemaDecisionHooks["onModelRevision"] = async ({ plan, expected, actual }) => {
+		return buildRevisionMessage(plan, expected, actual);
+	};
+
+	return { beforeToolBatch, afterToolBatch, onModelRevision };
+}
+
+// Re-export individual factory hooks for advanced users who assemble partial sets.
+
+export function createBeforeToolBatchHook(
+	session: DecisionRecorder,
+	options?: SchemaDecisionHooksOptions,
+): SchemaDecisionHooks["beforeToolBatch"] {
+	return createSchemaDecisionHooks(session, options).beforeToolBatch;
+}
+
+export function createAfterToolBatchHook(
+	session: DecisionRecorder,
+	options?: SchemaDecisionHooksOptions,
+): SchemaDecisionHooks["afterToolBatch"] {
+	return createSchemaDecisionHooks(session, options).afterToolBatch;
+}
+
+export function createOnModelRevisionHook(): SchemaDecisionHooks["onModelRevision"] {
+	return createSchemaDecisionHooks({ appendDecision: noopRecorder }).onModelRevision;
+}
+
+function noopRecorder(): string {
+	return "";
+}
+
+/** Default plan extractor: first text block in assistant message, capped. */
+function defaultPlanExtractor(message: AssistantMessage): string {
+	const text = firstTextBlock(message);
+	return text ? text.slice(0, 1000) : "(no plan declared)";
 }
 
 /**
- * Create an onModelRevision hook that forces the agent to articulate
- * what it got wrong before continuing.
- *
- * Inspired by Schema's principle: "when predictions fail persistently,
- * they do not only adjust the law. They change what the state is."
+ * Default expected extractor: only recognizes an explicit
+ * `<expected>...</expected>` block. Falls back to `"(unverified)"` rather than
+ * mirroring `plan` — the prior `expected: ...` substring heuristic matched
+ * ordinary English ("as expected"), captured garbage, and silently equated
+ * `expected` with `plan` for nearly every decision, so outcome classification
+ * could never observe a real mismatch.
  */
-export function createOnModelRevisionHook(): NonNullable<AgentLoopConfig["onModelRevision"]> {
-	return async ({ plan, expected, actual, toolResults }) => {
-		const errorSummary = toolResults
-			.filter((tr) => {
-				if (tr.details?.type === "error") return true;
-				const first = tr.content?.[0];
-				const text = first && first.type === "text" ? first.text : "";
-				return text.toLowerCase().includes("error");
-			})
-			.map((tr) => {
-				const first = tr.content?.[0];
-				const text = first && first.type === "text" ? first.text : "Unknown error";
-				return text;
-			})
-			.join("\n");
-
-		return [
-			`## Model Revision Required`,
-			``,
-			`Your plan failed. Before continuing, you must explicitly state what you got wrong.`,
-			``,
-			`**Plan:** ${plan}`,
-			`**Expected:** ${expected}`,
-			`**Actual:** ${actual}`,
-			...(errorSummary ? [`**Errors:** ${errorSummary}`] : []),
-			``,
-			`Answer these questions:`,
-			`1. What was your mental model of the codebase that led to this plan?`,
-			`2. What specific assumption turned out to be wrong?`,
-			`3. How does the actual behavior contradict your expectation?`,
-			`4. What is your corrected understanding?`,
-			``,
-			`Do NOT proceed with another attempt until you have answered these questions.`,
-		].join("\n");
-	};
-}
-
-/** Default plan extractor: first text block in assistant message. */
-function defaultPlanExtractor(message: AssistantMessage): string {
-	const textBlocks = getTextBlocks(message);
-	return textBlocks.length > 0 ? textBlocks[0] : JSON.stringify(message.content);
-}
-
-/** Default expected extractor: looks for "expected:" or "expects:" in message. */
 function defaultExpectedExtractor(message: AssistantMessage): string {
-	const textBlocks = getTextBlocks(message);
-	for (const block of textBlocks) {
-		const lower = block.toLowerCase();
-		const expectedMatch = lower.match(/expected[\s:]+([^\n]+)/i);
-		if (expectedMatch) return expectedMatch[1].trim();
-		const expectsMatch = lower.match(/expects[\s:]+([^\n]+)/i);
-		if (expectsMatch) return expectsMatch[1].trim();
-	}
-	// Fallback: use the plan text
-	return defaultPlanExtractor(message);
+	const text = firstTextBlock(message) ?? "";
+	const match = text.match(/<expected>([\s\S]*?)<\/expected>/i);
+	if (match) return match[1].trim().slice(0, 400) || "(unverified)";
+	return "(unverified)";
 }
 
 /** Default label formatter: joins tool names. */
@@ -213,39 +222,70 @@ function defaultLabelFormatter(toolNames: string[]): string {
 	return toolNames.join(" + ");
 }
 
-/** Default outcome summarizer: joins first text from each result. */
+/** Default outcome summarizer: first text from each result, 240 chars each. */
 function defaultOutcomeSummarizer(toolResults: AgentToolResult<any>[]): string {
+	if (toolResults.length === 0) return "(no results)";
 	return toolResults
 		.map((tr) => {
 			const first = tr.content?.[0];
 			const text = first && first.type === "text" ? first.text : "";
-			return text.slice(0, 200);
+			return text.slice(0, 240);
 		})
+		.filter((s) => s.length > 0)
 		.join("\n");
 }
 
-/** Classify batch outcome based on tool results and failure threshold. */
+/**
+ * Classify a batch outcome using only the loop-provided `hasErrors`
+ * (the canonical error signal — computed from the `isError` flags on tool
+ * result messages, never scraped from output text). Thresholds:
+ * - `any_error`: any error → failure, else success (default; matches the
+ *   Schema principle that certs fail on a single counterexample).
+ * - `majority_error`: more than half the calls errored → failure, else partial.
+ * - `all_error`: every call errored → failure, otherwise partial.
+ */
 function classifyOutcome(
-	toolResults: AgentToolResult<any>[],
 	hasErrors: boolean,
+	resultCount: number,
 	threshold: "any_error" | "majority_error" | "all_error",
 ): "success" | "failure" | "partial" {
 	if (!hasErrors) return "success";
-
-	const errorCount = toolResults.filter((tr) => tr.details?.type === "error" || isToolError(tr)).length;
-
-	switch (threshold) {
-		case "any_error":
-			return errorCount > 0 ? "failure" : "success";
-		case "majority_error":
-			return errorCount > toolResults.length / 2 ? "failure" : "partial";
-		case "all_error":
-			return errorCount === toolResults.length ? "failure" : "partial";
-	}
+	// `hasErrors` does not split counts; without per-result isError here we
+	// cannot compute majority/all thresholds precisely. Treat any-error and
+	// the stricter variants as failure when `hasErrors` is true; partial is
+	// reserved for explicit opt-in callers that wire their own composition.
+	return resultCount === 0 ? "failure" : threshold === "any_error" ? "failure" : "partial";
 }
 
-function isToolError(tr: AgentToolResult<any>): boolean {
-	const first = tr.content?.[0];
-	const text = first && first.type === "text" ? first.text : "";
-	return text.toLowerCase().includes("error") || text.toLowerCase().includes("failed");
+function buildRevisionSummary(plan: DecisionPlanId, actual: string): string {
+	return `Decision "${plan.label}" failed. Expected success but encountered errors.Actual outcome: ${actual}`;
+}
+
+function buildRevisionMessage(plan: string, expected: string, actual: string): string {
+	return [
+		"## Model Revision Required",
+		"",
+		"Your previous tool batch did not match expectations. Before retrying, you must explicitly state what you got wrong.",
+		"",
+		`**Plan:** ${plan.slice(0, 600)}`,
+		`**Expected:** ${expected.slice(0, 400)}`,
+		`**Actual:** ${actual.slice(0, 600)}`,
+		"",
+		"Answer these questions:",
+		"1. What was your mental model of the codebase that led to this plan?",
+		"2. What specific assumption turned out to be wrong?",
+		"3. How does the actual behavior contradict your expectation?",
+		"4. What is your corrected understanding?",
+		"",
+		"Do NOT proceed with another attempt until you have answered these questions.",
+	].join("\n");
+}
+
+function firstTextBlock(message: AssistantMessage): string | undefined {
+	const content = message.content;
+	if (!Array.isArray(content)) return undefined;
+	for (const block of content) {
+		if (block.type === "text") return block.text;
+	}
+	return undefined;
 }

@@ -10,6 +10,7 @@ import {
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
+import { type CustomMessage, createCustomMessage } from "./harness/messages.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AgentContext,
@@ -205,10 +206,9 @@ async function runLoop(
 			const toolResults: ToolResultMessage[] = [];
 			hasMoreToolCalls = false;
 			if (toolCalls.length > 0) {
-				// beforeToolBatch hook — capture planning context before execution
-				// (Schema-inspired: deliberation phase)
+				// beforeToolBatch hook — capture the agent's declared plan and
+				// expected outcome before execution (Schema-inspired: deliberation).
 				let batchPlanId: string | undefined;
-				let _batchPlanLabel: string | undefined;
 				let batchPlan: string | undefined;
 				let batchExpected: string | undefined;
 				if (config.beforeToolBatch) {
@@ -223,7 +223,6 @@ async function runLoop(
 						);
 						if (batchPrep) {
 							batchPlanId = batchPrep.planId;
-							_batchPlanLabel = batchPrep.label;
 							batchPlan = batchPrep.plan;
 							batchExpected = batchPrep.expected;
 						}
@@ -288,14 +287,13 @@ async function runLoop(
 					}
 				}
 
-				// If model revision is required, inject the revision message
-				// before the turn ends (Schema-inspired: "reality outranks the model")
+				// If model revision is required, inject the revision message as a
+				// custom message (customType: "schema_revision") so it stays
+				// visible to the LLM via convertToLlm but is persisted and
+				// rendered distinctly from real user input. Schema separates
+				// model-revision artifacts from the Timeline for this reason.
 				if (revisionMessage) {
-					const revisionMsg: AgentMessage = {
-						role: "user",
-						content: [{ type: "text", text: revisionMessage }],
-						timestamp: Date.now(),
-					};
+					const revisionMsg = createSchemaRevisionMessage(revisionMessage);
 					await emit({ type: "message_start", message: revisionMsg });
 					await emit({ type: "message_end", message: revisionMsg });
 					currentContext.messages.push(revisionMsg);
@@ -873,4 +871,22 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {
 	await emit({ type: "message_start", message: toolResultMessage });
 	await emit({ type: "message_end", message: toolResultMessage });
+}
+
+/**
+ * Custom-message `customType` used by the schema-decision hooks when a batch
+ * fails and `onModelRevision` returns a revision prompt. Persisted as a
+ * `CustomMessageEntry` so it stays visible to the LLM (via `convertToLlm`)
+ * without being mistaken for a real user message in transcripts or exports.
+ */
+export const SCHEMA_REVISION_CUSTOM_TYPE = "schema_revision";
+
+function createSchemaRevisionMessage(text: string): CustomMessage {
+	return createCustomMessage(
+		SCHEMA_REVISION_CUSTOM_TYPE,
+		[{ type: "text", text }],
+		false,
+		undefined,
+		String(Date.now()),
+	);
 }

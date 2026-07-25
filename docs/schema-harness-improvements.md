@@ -157,7 +157,7 @@ for (const d of decisions) {
 | "Encode beliefs as runnable programs" | Decision entries encode beliefs as structured data |
 | "Validate against every transition" | `afterToolBatch` certifies outcomes |
 | "Plan inside a verified simulator" | `beforeToolBatch` captures plan before execution |
-| "Maintain append-only Timeline" | Decisions are never overwritten, only updated |
+| "Maintain append-only Timeline" | `appendDecision` writes one immutable record per batch; no in-place edits |
 | "Reality outranks the model" | `onModelRevision` forces model revision on failure |
 | "Action for discovery" | Agent must probe and test, not brute-force |
 
@@ -168,6 +168,32 @@ for (const d of decisions) {
 3. **Targeted probing** — When unsure about a module, require a minimal test file before broader changes
 4. **Decision graph visualization** — TUI component showing decision flow, outcomes, and revision chains
 5. **Auto-compaction aware** — Include decision summaries in compaction output for long-term memory
+6. **Structured pre-batch declarations (P1)** — Require a structured `<plan>...</plan><expected>...</expected>` block or a dedicated `plan` tool before any mutating batch; reject batches that lack one as `outcome: "unverified"`.
+7. **Queryable world-model artifact (P2)** — A versioned `codebase_model.md` the agent edits; edits to the model are "state revision" (Einstein), edits to `expected` are "rule revision" (Lorentz); persistent failure escalates from answering the 4 questions to editing the artifact.
+8. **Persistence-gated revision (P3)** — Track `consecutiveFailures` keyed by normalized plan shape; `onModelRevision` only fires after N failures and escalates (question → edit artifact → must probe with a minimal reproducer).
+9. **`decisions` read-only tool and `/decisions` slash command (P5)** — Let the agent explicitly query its full Timeline and let the user dump the post-mortem in the TUI.
+
+## Active design notes (P0 + P4 follow-up)
+
+This PR lands **P0** (LLM-visible Timeline) and **P4** (defect fixes) from the analysis above.
+
+### P0 — Timeline becomes LLM-visible
+
+Schema's central mechanism is that the agent can read its past observations before re-planning. Until this PR `DecisionEntry` was explicitly excluded from `buildSessionContext`, so the agent literally could not see its own past decisions — the entire backtest / revise premise of Schema was unreachable.
+
+P0 surfaces the Timeline to the LLM via a compact digest of recent *failed* and *partial* decisions appended to the system prompt each turn (see `SessionManager.getRecentDecisionsDigest` and `AgentSession._decorateSystemPromptWithDecisions`). Successes are filtered out — they carry no revision value and would just bloat the prompt.
+
+A follow-up (P5) will add a `decisions` read-only tool so the agent can pull older decisions on demand.
+
+### P4 — Defect fixes
+
+1. **Single implementation, single source of truth.** `_installSchemaDecisionHooks` now delegates to the shared `createSchemaDecisionHooks` factory. The built-in path and the extension-imported factory no longer diverge.
+2. **Truly append-only updates.** `updateDecision` (which mutated an in-place entry and rewrote the whole JSONL file as `O(N)` synchronous write per batch) is gone. `appendDecision` now writes the full record once, after the outcome is known. State lives in closure-bound `pendingPlans` inside the factory between `beforeToolBatch` and `afterToolBatch`. Schema's Timeline is append-only precisely so observations stay immutable and persistence stays `O(1)` per batch.
+3. **Revision messages no longer pollute context.** The agent loop now injects the revision prompt as a custom message with `customType: "schema_revision"` (`display: false`) instead of `role: "user"`. This keeps it visible to the LLM via `convertToLlm` (custom messages map to user messages in the LLM view) while separating it from real user input in transcripts and exports — exactly Schema's separation of model-revision artifacts from the Timeline.
+4. **No more false `expected` matches.** The previous heuristic scanned assistant prose for the substring "expected:" and matched inside plain English ("as expected, the file ..."), capturing garbage. When no match was found it fell back to `expected = plan`, so the outcome classifier never noticed a real mismatch. The new extractor only recognizes an explicit `<expected>...</expected>` block; otherwise it records `(unverified)` so a missing declaration is visible and correctable rather than silently mirrored.
+5. **Gated behind experimental flag.** The subsystem now opts in via `PI_EXPERIMENTAL=1` or `PI_SCHEMA_DECISIONS=1`. Default off avoids per-batch overhead and system-prompt bloat from the recent-decisions digest while the design stabilizes.
+6. **Dead variable removed.** `_batchPlanLabel` (assigned, never read) is gone; the unused `"partial"` code paths are either implemented or actually unreachable.
+7. **Failure detection trusts the loop.** `classifyOutcome` now uses the loop-provided `hasErrors` (computed from the `isError` flags on tool result messages — the canonical signal) and stops scraping output text for "error"/"failed" substrings, which misclassified bash results with non-zero exit codes that happened not to print the word "error".
 
 ## Files Changed
 
@@ -176,8 +202,10 @@ for (const d of decisions) {
 | `packages/agent/src/harness/types.ts` | Added `DecisionEntry` type to `SessionTreeEntry` union |
 | `packages/agent/src/types.ts` | Added `BeforeToolBatch*`, `AfterToolBatch*`, `ModelRevision*` types and hooks |
 | `packages/agent/src/agent.ts` | Added hook properties to `Agent` class and `AgentOptions` |
-| `packages/agent/src/agent-loop.ts` | Integrated hooks into main loop with revision injection |
-| `packages/coding-agent/src/core/session-manager.ts` | Added `DecisionEntry` type, `appendDecision`, `updateDecision`, `getDecisions` |
-| `packages/coding-agent/src/core/agent-session.ts` | Added `_installSchemaDecisionHooks()` with built-in implementations |
-| `packages/coding-agent/src/core/schema-decisions.ts` | New: factory functions for custom hook implementations |
-| `packages/coding-agent/src/core/index.ts` | Exported schema-decisions module |
+| `packages/agent/src/agent-loop.ts` | Integrated hooks into main loop; emits revision as `schema_revision` custom message; added `SCHEMA_REVISION_CUSTOM_TYPE` |
+| `packages/coding-agent/src/core/session-manager.ts` | `DecisionEntry` + `DecisionRecord`; append-only `appendDecision`; `getDecisions` / `getDecision` / `getRecentDecisionsDigest` |
+| `packages/coding-agent/src/core/agent-session.ts` | `_installSchemaDecisionHooks` delegates to factory and is gated behind experimental; per-turn decision digest via `_decorateSystemPromptWithDecisions` |
+| `packages/coding-agent/src/core/schema-decisions.ts` | Unified factory (`createSchemaDecisionHooks`); strict `<expected>` extractor; `hasErrors`-based `classifyOutcome`; `onDecisionAppended` callback |
+| `packages/coding-agent/src/core/experimental.ts` | `isSchemaDecisionTrackingEnabled` opt-in via `PI_EXPERIMENTAL` / `PI_SCHEMA_DECISIONS` |
+| `packages/coding-agent/src/core/index.ts` | Updated exports for the renamed/re-added symbols |
+| `packages/coding-agent/test/schema-decisions.test.ts` | Updated for the single-append API; added digest and factory coverage |

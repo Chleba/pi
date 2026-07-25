@@ -82,6 +82,10 @@ export {
 	createAfterToolBatchHook,
 	createBeforeToolBatchHook,
 	createOnModelRevisionHook,
-	type DecisionBatch,
+	createSchemaDecisionHooks,
+	type DecisionPlanId,
+	type DecisionRecorder,
+	type SchemaDecisionHooks,
+	type SchemaDecisionHooksOptions,
 } from "./schema-decisions.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

@@ -63,6 +63,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import { isSchemaDecisionTrackingEnabled } from "./experimental.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -97,6 +98,7 @@ import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
+import { createSchemaDecisionHooks } from "./schema-decisions.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
@@ -526,93 +528,28 @@ export class AgentSession {
 	 * validate against recorded transitions, plan inside verified simulators, and
 	 * maintain an append-only Timeline.
 	 *
-	 * These hooks add:
-	 * - beforeToolBatch: captures the agent's declared plan before execution
-	 * - afterToolBatch: records outcomes and detects mismatches
-	 * - onModelRevision: forces explicit model revision on failure
+	 * Opt-in via `PI_EXPERIMENTAL=1` or `PI_SCHEMA_DECISIONS=1`: off by default to
+	 * avoid per-batch overhead and system-prompt bloat from the recent-decisions
+	 * digest. When enabled, the three hooks are delegated to the shared
+	 * `createSchemaDecisionHooks` factory so the built-in path and the extension
+	 * factory path are always the same implementation.
 	 */
 	private _installSchemaDecisionHooks(): void {
-		this.agent.beforeToolBatch = async ({ assistantMessage, toolCalls, context: _context }) => {
-			// Extract plan from assistant message
-			const textBlocks = assistantMessage.content.filter((c) => c.type === "text");
-			const plan =
-				textBlocks.length > 0 ? textBlocks[0]!.text.slice(0, 500) : JSON.stringify(assistantMessage.content);
+		if (!isSchemaDecisionTrackingEnabled()) {
+			return;
+		}
 
-			// Look for expected outcome in message
-			let expected = plan;
-			for (const block of textBlocks) {
-				const lower = block.text.toLowerCase();
-				const expectedMatch = lower.match(/expected[\s:]+([^\n]+)/i);
-				if (expectedMatch) {
-					expected = expectedMatch[1].trim();
-					break;
+		const hooks = createSchemaDecisionHooks(this.sessionManager, {
+			onDecisionAppended: (entryId) => {
+				const entry = this.sessionManager.getDecision(entryId);
+				if (entry) {
+					this._emit({ type: "entry_appended", entry });
 				}
-			}
-
-			// Create label from tool names
-			const label = toolCalls.map((tc) => tc.name).join(" + ");
-
-			// Append decision entry
-			const entryId = this.sessionManager.appendDecision(label, plan, expected);
-			const entry = this.sessionManager.getEntry(entryId);
-			if (entry) {
-				this._emit({ type: "entry_appended", entry });
-			}
-
-			return {
-				planId: entryId,
-				label,
-				plan,
-				expected,
-			};
-		};
-
-		this.agent.afterToolBatch = async ({ planId, toolResults, hasErrors, context: _context }) => {
-			// Summarize outcomes
-			const actual = toolResults
-				.map((tr) => {
-					const first = tr.content?.[0];
-					const text = first && first.type === "text" ? first.text : "";
-					return text.slice(0, 200);
-				})
-				.join("\n");
-
-			// Classify outcome
-			const outcome = hasErrors ? "failure" : "success";
-
-			// Update decision entry
-			this.sessionManager.updateDecision(planId, actual, outcome);
-
-			return {
-				actual,
-				outcome,
-				revisionRequired: outcome === "failure",
-				revision:
-					outcome === "failure"
-						? `Decision "${planId}" failed. Expected success but encountered errors.\nActual outcome: ${actual}\n\nRevise your mental model of the codebase before retrying.`
-						: undefined,
-			};
-		};
-
-		this.agent.onModelRevision = async ({ plan, expected, actual, toolResults: _toolResults }) => {
-			return [
-				`## Model Revision Required`,
-				``,
-				`Your plan failed. Before continuing, you must explicitly state what you got wrong.`,
-				``,
-				`**Plan:** ${plan.slice(0, 300)}`,
-				`**Expected:** ${expected.slice(0, 200)}`,
-				`**Actual:** ${actual.slice(0, 300)}`,
-				``,
-				`Answer these questions:`,
-				`1. What was your mental model of the codebase that led to this plan?`,
-				`2. What specific assumption turned out to be wrong?`,
-				`3. How does the actual behavior contradict your expectation?`,
-				`4. What is your corrected understanding?`,
-				``,
-				`Do NOT proceed with another attempt until you have answered these questions.`,
-			].join("\n");
-		};
+			},
+		});
+		this.agent.beforeToolBatch = hooks.beforeToolBatch;
+		this.agent.afterToolBatch = hooks.afterToolBatch;
+		this.agent.onModelRevision = hooks.onModelRevision;
 	}
 
 	private _installAgentNextTurnRefresh(): void {
@@ -625,17 +562,35 @@ export class AgentSession {
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
 			const previousContext = previousSnapshot?.context ?? turn.context;
 
+			// Append the LLM-visible half of the Timeline: recent failed/partial
+			// decisions. When schema tracking is off or no decisions exist, this
+			// is a no-op so the system prompt stays unchanged.
+			const baseSystemPrompt = this._systemPromptOverride ?? this._baseSystemPrompt;
+			const systemPrompt = this._decorateSystemPromptWithDecisions(baseSystemPrompt);
+
 			return {
 				...previousSnapshot,
 				context: {
 					...previousContext,
-					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
+					systemPrompt,
 					tools: this.agent.state.tools.slice(),
 				},
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
 		};
+	}
+
+	/**
+	 * Append the recent-decisions digest to a base system prompt. No-op when
+	 * schema tracking is disabled (saves an extra pass over entries and keeps
+	 * the prompt byte-for-byte identical to the base).
+	 */
+	private _decorateSystemPromptWithDecisions(baseSystemPrompt: string): string {
+		if (!isSchemaDecisionTrackingEnabled()) return baseSystemPrompt;
+		const digest = this.sessionManager.getRecentDecisionsDigest(5);
+		if (!digest) return baseSystemPrompt;
+		return `${baseSystemPrompt}\n\n${digest}`;
 	}
 
 	// =========================================================================
