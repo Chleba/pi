@@ -1153,6 +1153,26 @@ export class AgentSession {
 			return true;
 		}
 
+		// Auto-continuation: if the agent declared plan/expected but included
+		// no tool calls, queue a follow-up to nudge it to actually act.
+		if (
+			isSchemaDecisionTrackingEnabled() &&
+			msg.content.some((c) => c.type === "text") &&
+			!msg.content.some((c) => c.type === "toolCall")
+		) {
+			const textBlock = msg.content.find((c): c is TextContent => c.type === "text");
+			const text = textBlock?.text ?? "";
+			if (/<plan>/i.test(text) && /<expected>/i.test(text)) {
+				this.agent.followUp({
+					role: "user",
+					content:
+						"You declared your plan but did not include any tool calls. Re-issue your tool calls now with the declaration tags in the same response.",
+					timestamp: Date.now(),
+				});
+				return true;
+			}
+		}
+
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
 		return this.agent.hasQueuedMessages();

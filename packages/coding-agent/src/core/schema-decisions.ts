@@ -332,29 +332,42 @@ const UNVERIFIED_EXPECTED = "(unverified)";
 /** Sentinel string recorded as `revision` when the batch was rejected for missing a declaration. */
 const UNDECLARED_REVISION = "missing <plan>/<expected> declaration";
 
-/** Default plan extractor: recognizes an explicit `<plan>...</plan>` block, else records `(undeclared)`. */
+/**
+ * Default plan extractor: recognizes an explicit `<plan>` block.
+ * The closing tag is optional — if the LLM writes `<plan>Edit app.ts`
+ * without `</plan>`, everything after the opening tag up to the next
+ * `<` or end-of-text is captured as the plan content.
+ */
 function defaultPlanExtractor(message: AssistantMessage): string {
 	const text = firstTextBlock(message) ?? "";
-	const match = text.match(/<plan>([\s\S]*?)<\/plan>/i);
-	if (match) return match[1].trim().slice(0, 1000) || UNDECLARED_PLAN;
-	// Fall back to the first text block so a misbehaving agent still leaves a
-	// usable record in the Timeline; `declared` is computed separately and
-	// will still be false, so enforcement kicks in.
-	return text.slice(0, 1000) ? text.slice(0, 1000) : UNDECLARED_PLAN;
+	// Strict match first: <plan>...</plan>
+	const strict = text.match(/<plan>([\s\S]*?)<\/plan>/i);
+	if (strict) return strict[1].trim().slice(0, 1000) || UNDECLARED_PLAN;
+	// Tolerant fallback: <plan> without closing tag — capture up to next '<' or end.
+	const tolerant = text.match(/<plan>([\s\S]*?)(?:<|$)/i);
+	if (tolerant) return tolerant[1].trim().slice(0, 1000) || UNDECLARED_PLAN;
+	return UNDECLARED_PLAN;
 }
 
 /**
- * Default expected extractor: only recognizes an explicit
- * `<expected>...</expected>` block. Falls back to `"(unverified)"` rather than
- * mirroring `plan` — the prior `expected: ...` substring heuristic matched
- * ordinary English ("as expected"), captured garbage, and silently equated
- * `expected` with `plan` for nearly every decision, so outcome classification
- * could never observe a real mismatch.
+ * Default expected extractor: recognizes an explicit `<expected>` block.
+ * The closing tag is optional — if the LLM writes `<expected>tests pass`
+ * without `</expected>`, everything after the opening tag up to the next
+ * `<` or end-of-text is captured as the expected outcome.
+ *
+ * Falls back to `"(unverified)"` rather than mirroring `plan` — the prior
+ * `expected: ...` substring heuristic matched ordinary English ("as expected"),
+ * captured garbage, and silently equated `expected` with `plan` for nearly
+ * every decision, so outcome classification could never observe a real mismatch.
  */
 function defaultExpectedExtractor(message: AssistantMessage): string {
 	const text = firstTextBlock(message) ?? "";
-	const match = text.match(/<expected>([\s\S]*?)<\/expected>/i);
-	if (match) return match[1].trim().slice(0, 400) || "(unverified)";
+	// Strict match first: <expected>...</expected>
+	const strict = text.match(/<expected>([\s\S]*?)<\/expected>/i);
+	if (strict) return strict[1].trim().slice(0, 400) || "(unverified)";
+	// Tolerant fallback: <expected> without closing tag — capture up to next '<' or end.
+	const tolerant = text.match(/<expected>([\s\S]*?)(?:<|$)/i);
+	if (tolerant) return tolerant[1].trim().slice(0, 400) || "(unverified)";
 	return "(unverified)";
 }
 
@@ -412,13 +425,19 @@ function buildDeclarationRequiredMessage(): string {
 	return [
 		"## Declaration Required Before Mutating Actions",
 		"",
-		"Your previous tool batch would mutate files or run stateful commands, but it did not include an explicit plan. Premise of deliberation before action: state what you intend and what you expect, *then* act.",
+		"Your previous tool batch would mutate files or run stateful commands, but it did not include an explicit plan. Premise of deliberation before action: state what you intend and what you expect, *then* act — in the SAME response.",
 		"",
 		"Before any batch that includes `bash`, `edit`, or `write`, your preceding text MUST contain BOTH:",
 		"  - `<plan> ... </plan>` — a short description of the action(s) you intend, and",
 		"  - `<expected> ... </expected>` — the observable outcome you will use to certify success (command exit code, file contents, test result, etc.).",
 		"",
-		"Re-issue your previous tool calls with those two blocks included. Do not retry the mutation without them.",
+		"Re-issue your previous tool calls WITH these tags in the same response. Example:",
+		"",
+		"  <plan>Read src/file.ts to find the type definition</plan>",
+		"  <expected>The read tool succeeds and returns the file contents</expected>",
+		"  [your tool calls here]",
+		"",
+		"Do NOT declare and then wait. Declare AND include the tool calls in this one response.",
 	].join("\n");
 }
 
@@ -437,7 +456,9 @@ export const SCHEMA_DECLARATION_CONVENTION = [
 	"Before any tool batch that mutates state (bash, edit, write), your preceding text MUST include BOTH:",
 	"  - <plan> ... </plan>   — what you intend to do in this batch",
 	"  - <expected> ... </expected> — the observable outcome you will use to certify success",
-	"A mutating batch without both blocks will be rejected and you will be asked to declare before retrying.",
+	"Both tags MUST have their opening AND closing forms (e.g. <plan>text</plan>, not <plan>text). Missing closing tags cause the batch to be rejected.",
+	"You MUST include the tool calls in the SAME response as these tags. Do not declare first then wait; declare AND act in one turn.",
+	"A mutating batch without both complete blocks will be rejected and you will be asked to declare before retrying.",
 	"</schema_declaration_convention>",
 ].join("\n");
 
@@ -451,13 +472,13 @@ function buildRevisionMessage(plan: string, expected: string, actual: string): s
 		`**Expected:** ${expected.slice(0, 400)}`,
 		`**Actual:** ${actual.slice(0, 600)}`,
 		"",
-		"Answer these questions:",
+		"Answer these questions, then re-issue your corrected tool calls in the SAME response:",
 		"1. What was your mental model of the codebase that led to this plan?",
 		"2. What specific assumption turned out to be wrong?",
 		"3. How does the actual behavior contradict your expectation?",
 		"4. What is your corrected understanding?",
 		"",
-		"Do NOT proceed with another attempt until you have answered these questions.",
+		"After answering, include your tool calls in the same response. Do not answer and wait — answer AND retry the tool calls in this one turn.",
 	].join("\n");
 }
 
